@@ -38,6 +38,13 @@ def main():
     parser.add_argument("--test_root", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--zip_path", default=None)
+    # 推理分辨率可脱离 config 覆盖：实测 run2/epoch41 在 768 方形上 mAP@50-95 比 640
+    # 高 2.4 分（0.5111 → 0.5355），因为 768 恰是多尺度训练档位的上界，仍在分布内；
+    # 再往上（1120/1280）就掉出分布外开始下滑。
+    parser.add_argument("--image_size", default=None, help="int 或 'h,w'；不传则用 config 值")
+    # run2 及更早的权重是在 disp8 深度全零的输入上训出来的，推理必须传 zero 复刻该行为
+    # （实测传 use 会让 disp8 子域从 0.5693 掉到 0.5448）。重训后的权重用 use。
+    parser.add_argument("--disp8_mode", default=None, choices=["use", "zero"])
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -68,8 +75,17 @@ def main():
     if not samples:
         raise RuntimeError(f"no samples found under {args.test_root}")
 
-    tf = SyncMultiModalTransform(size=cfg["image_size"], train=False)
-    ds = MultiModalDetDataset(samples, tf, has_labels=False)
+    if args.image_size is None:
+        infer_size = cfg["image_size"]
+    elif "," in args.image_size:
+        infer_size = [int(v) for v in args.image_size.split(",")]
+    else:
+        infer_size = int(args.image_size)
+    disp8_mode = args.disp8_mode or cfg.get("train", {}).get("disp8_mode", "use")
+    print(f"[infer] image_size={infer_size} disp8_mode={disp8_mode}")
+
+    tf = SyncMultiModalTransform(size=infer_size, train=False)
+    ds = MultiModalDetDataset(samples, tf, has_labels=False, disp8_mode=disp8_mode)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn)
 
     written_stems = set()

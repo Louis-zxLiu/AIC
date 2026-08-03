@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import time
 
 import torch
@@ -184,8 +185,9 @@ def main():
         total_epochs=train_cfg["epochs"],
     )
     val_tf = SyncMultiModalTransform(size=cfg["image_size"], train=False)
-    train_ds = MultiModalDetDataset(train_samples, train_tf, has_labels=True)
-    val_ds = MultiModalDetDataset(val_samples, val_tf, has_labels=True)
+    disp8_mode = train_cfg.get("disp8_mode", "use")
+    train_ds = MultiModalDetDataset(train_samples, train_tf, has_labels=True, disp8_mode=disp8_mode)
+    val_ds = MultiModalDetDataset(val_samples, val_tf, has_labels=True, disp8_mode=disp8_mode)
 
     # 类别不均衡重采样（算法设计.md §3.4，计划.md §2.4 tier 1）：ClassBalancedDataset
     # 风格的按类别频率过采样。DistributedSampler 不支持自定义样本权重，DDP 模式下暂时
@@ -300,6 +302,26 @@ def main():
             ema.updates = ckpt.get("ema_updates", 0)
         if is_main_process():
             print(f"[resume] from {args.resume}, starting epoch {start_epoch}")
+
+    # checkpoint 轮转用：断点恢复时从 curves.json 取回历史最佳，避免把之前的
+    # 最优权重当成旧文件删掉。
+    best_map, best_epoch = -1.0, -1
+    if is_main_process() and curve_logger is not None:
+        hist = os.path.join(save_dir, "curves.json")
+        if os.path.exists(hist):
+            try:
+                import json
+
+                with open(hist, "r", encoding="utf-8") as f:
+                    rec = json.load(f)
+                eps = rec.get("eval_epochs", [])
+                vals = rec.get("eval_metrics", {}).get("mAP@50-95", [])
+                for ep, v in zip(eps, vals):
+                    if v is not None and v > best_map:
+                        best_map, best_epoch = float(v), int(ep)
+                print(f"[ckpt] 历史最佳 epoch{best_epoch} mAP@50-95={best_map:.4f}")
+            except Exception as exc:
+                print(f"[ckpt] 读取 curves.json 失败，轮转按无历史处理: {exc}")
 
     for epoch in range(start_epoch, train_cfg["epochs"]):
         model.train()
@@ -425,8 +447,35 @@ def main():
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
                 ckpt["ema_updates"] = ema.updates
-            torch.save(ckpt, ckpt_path)
+            # 先写临时文件再原子改名：写盘失败（如磁盘满）不会留下截断的 .pt，
+            # 断点恢复时也不会读到坏文件。
+            tmp_path = ckpt_path + ".tmp"
+            try:
+                torch.save(ckpt, tmp_path)
+                os.replace(tmp_path, ckpt_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
             print(f"[ckpt] saved {ckpt_path}")
+
+            # checkpoint 轮转：每个 1.5GB，48 epoch 全留会写满磁盘。
+            # 只保留最近 keep_last_n 个 + 历史最佳。
+            keep_last_n = int(train_cfg.get("keep_last_n", 3))
+            if keep_last_n > 0:
+                if eval_result.map_50_95 > best_map:
+                    best_map = eval_result.map_50_95
+                    best_epoch = epoch
+                saved = []
+                for fn in os.listdir(save_dir):
+                    m = re.fullmatch(r"epoch(\d+)\.pt", fn)
+                    if m:
+                        saved.append((int(m.group(1)), fn))
+                saved.sort()
+                for ep, fn in saved[:-keep_last_n]:
+                    if ep != best_epoch:
+                        os.remove(os.path.join(save_dir, fn))
+                        print(f"[ckpt] pruned {fn}")
 
             if eval_state_backup is not None:
                 ema.restore(model, eval_state_backup)

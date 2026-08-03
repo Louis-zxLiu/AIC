@@ -21,7 +21,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .modalities import load_depth_raw, load_infrared, load_labels_yolo, load_visible, preprocess_depth
+from .modalities import (
+    DEPTH_KIND_BAD,
+    DEPTH_KIND_DISP8,
+    load_depth_raw,
+    load_infrared,
+    load_labels_yolo,
+    load_visible,
+    preprocess_depth,
+)
 from .transforms import SyncMultiModalTransform
 
 IMG_EXTS = (".png", ".jpg", ".jpeg")
@@ -132,10 +140,27 @@ def compute_class_balanced_weights(samples: list[Sample], oversample_thr: float 
 
 
 class MultiModalDetDataset(Dataset):
-    def __init__(self, samples: list[Sample], transform: SyncMultiModalTransform, has_labels: bool = True):
+    """disp8_mode 控制 8bit 视差深度（149 训练 / 155 测试图，见 modalities.py 文档）：
+
+      "use"  —— 正常解码使用。重训必须用这个，否则又把 15.5% 测试图的 depth 白扔。
+      "zero" —— 整路置零，复刻旧行为。**只给 run2 及更早的 checkpoint 推理用**：
+                那些权重是在 disp8 全零的输入上训出来的，喂真实深度反而掉分
+                （实测 epoch41 @768：disp8 子域 0.5693 → 0.5448），属训练/推理不一致。
+    """
+
+    def __init__(
+        self,
+        samples: list[Sample],
+        transform: SyncMultiModalTransform,
+        has_labels: bool = True,
+        disp8_mode: str = "use",
+    ):
+        if disp8_mode not in ("use", "zero"):
+            raise ValueError(f"disp8_mode 必须是 'use' 或 'zero'，收到 {disp8_mode!r}")
         self.samples = samples
         self.transform = transform
         self.has_labels = has_labels
+        self.disp8_mode = disp8_mode
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -145,10 +170,13 @@ class MultiModalDetDataset(Dataset):
 
         visible = load_visible(s.visible_path)
         infrared = load_infrared(s.infrared_path)
-        depth_mm, is_valid_format = load_depth_raw(s.depth_path)
-        if not is_valid_format:
-            print(f"[warn] {s.stem}: depth file is not single-channel 'I' mode, treating as fully invalid")
-        depth_norm, valid_mask = preprocess_depth(depth_mm, is_valid_format)
+        depth_raw, depth_kind = load_depth_raw(s.depth_path)
+        if depth_kind == DEPTH_KIND_BAD:
+            print(f"[warn] {s.stem}: depth 无法解析为深度容器，该图 depth 分支置全零")
+        if depth_kind == DEPTH_KIND_DISP8 and self.disp8_mode == "zero":
+            # 刻意置零（复刻 run2 的训练输入），不是解析失败，所以不复用上面那条 warn。
+            depth_kind = DEPTH_KIND_BAD
+        depth_norm, valid_mask = preprocess_depth(depth_raw, depth_kind)
 
         if self.has_labels and s.label_path is not None:
             arr = load_labels_yolo(s.label_path)
@@ -184,10 +212,20 @@ class MultiScaleCollate:
     base_size，与强增强的 stop_epoch policy 同步收尾。
     """
 
-    def __init__(self, base_size: int = 640, sizes: tuple[int, ...] = (512, 576, 640, 704, 768)):
-        self.base_size = base_size
-        self.sizes = sizes
+    def __init__(
+        self,
+        base_size: int | tuple[int, int] | list[int] = 640,
+        sizes: tuple = (512, 576, 640, 704, 768),
+    ):
+        # base_size / sizes 的元素都支持 int（方形）或 (h, w)（矩形）。矩形输入下
+        # 各档必须保持与 base 相同的长宽比，否则多尺度会额外注入形状畸变。
+        self.base_size = self._as_hw(base_size)
+        self.sizes = tuple(self._as_hw(s) for s in sizes)
         self.active = True
+
+    @staticmethod
+    def _as_hw(s) -> tuple[int, int]:
+        return (int(s), int(s)) if isinstance(s, int) else (int(s[0]), int(s[1]))
 
     def set_epoch_active(self, active: bool) -> None:
         self.active = active
@@ -198,9 +236,8 @@ class MultiScaleCollate:
         depth = torch.stack([b[2] for b in batch], dim=0)
         targets = [b[3] for b in batch]
 
-        target_size = random.choice(self.sizes) if self.active else self.base_size
-        if target_size != vis.shape[-1]:
-            size = (target_size, target_size)
+        size = random.choice(self.sizes) if self.active else self.base_size
+        if size != tuple(vis.shape[-2:]):
             vis = torch.nn.functional.interpolate(vis, size=size, mode="bilinear", align_corners=False)
             ir = torch.nn.functional.interpolate(ir, size=size, mode="bilinear", align_corners=False)
             # depth 的第2通道是 {0,1} valid_mask，用 nearest 保持硬边界语义，

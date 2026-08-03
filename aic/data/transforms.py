@@ -21,7 +21,7 @@ import torchvision.transforms.functional as TF
 class SyncMultiModalTransform:
     def __init__(
         self,
-        size: int = 640,
+        size: int | tuple[int, int] | list[int] = 640,
         train: bool = True,
         hflip_p: float = 0.5,
         scale_range: tuple[float, float] = (0.5, 1.5),
@@ -29,8 +29,15 @@ class SyncMultiModalTransform:
         final_scale_range: tuple[float, float] = (0.9, 1.1),
         stop_decay_epoch_ratio: float = 0.8,
         total_epochs: int = 1,
+        min_box_px: float = 2.0,
     ):
-        self.size = size
+        # size 支持 int（方形）或 (h, w)（矩形）。数据集全是 16:9，方形 resize 会带来
+        # 1.78x 的形状畸变并把面积压到 0.44 倍，矩形输入同时解决畸变和小目标丢失。
+        self.size_hw: tuple[int, int] = (
+            (int(size), int(size)) if isinstance(size, int) else (int(size[0]), int(size[1]))
+        )
+        self.size = self.size_hw  # 兼容旧字段名
+        self.min_box_px = min_box_px
         self.train = train
         self.hflip_p = hflip_p
         self.base_scale_range = scale_range
@@ -90,7 +97,11 @@ class SyncMultiModalTransform:
             vis, ir, dep, msk = self._resize_only(vis, ir, dep, msk)
 
         if self.train and boxes.numel():
-            keep = (boxes[:, 2] > 1e-4) & (boxes[:, 3] > 1e-4)
+            # 阈值按输出像素算，不用归一化常数：旧的 1e-4 归一化 ≈ 0.06px，形同没过滤，
+            # 裁剪后只剩一条线的退化框会照样进 Hungarian 匹配，污染回归目标。对齐 D-FINE
+            # 官方 SanitizeBoundingBoxes(min_size=1)，这里取 2px 略严一点。
+            out_h, out_w = self.size_hw
+            keep = (boxes[:, 2] * out_w >= self.min_box_px) & (boxes[:, 3] * out_h >= self.min_box_px)
             boxes = boxes[keep]
             labels_t = labels_t[keep]
 
@@ -111,38 +122,57 @@ class SyncMultiModalTransform:
         return vis, ir, depth_stack, target
 
     def _resize_only(self, vis, ir, dep, msk):
-        vis = TF.resize(vis, [self.size, self.size], antialias=True)
-        ir = TF.resize(ir, [self.size, self.size], antialias=True)
-        dep = TF.resize(dep, [self.size, self.size], antialias=True)
-        msk = TF.resize(msk, [self.size, self.size], antialias=False)
+        out = list(self.size_hw)
+        vis = TF.resize(vis, out, antialias=True)
+        ir = TF.resize(ir, out, antialias=True)
+        dep = TF.resize(dep, out, antialias=True)
+        msk = TF.resize(msk, out, antialias=False)
         return vis, ir, dep, msk
 
     def _random_resized_crop(self, vis, ir, dep, msk, boxes):
+        """scale>1 放大（裁小窗口），scale<1 缩小（先 zero-pad 出更大画布再取窗口）。
+
+        旧实现用 `crop_h = min(h, int(h / scale))`，scale<1 时 int(h/scale) > h，被
+        min 钳回 h —— 于是 scale_range 的整个下半段 (0.5, 1.0) 完全是 no-op，模型从
+        未见过"目标变小"的样本。而 640 方形输入已经把目标面积压到 0.44 倍、47% 的框
+        落进 <32px 的小目标桶，正是最需要 zoom-out 覆盖的尺度区间。这里补上 padding
+        路径，语义对齐 D-FINE 官方的 RandomZoomOut(fill=0)。
+        """
         _, h, w = vis.shape
         scale = random.uniform(*self.scale_range)
-        crop_h = min(h, max(1, int(h / scale)))
-        crop_w = min(w, max(1, int(w / scale)))
-        top = random.randint(0, h - crop_h)
-        left = random.randint(0, w - crop_w)
+        win_h = max(1, int(round(h / scale)))
+        win_w = max(1, int(round(w / scale)))
 
-        vis = TF.resized_crop(vis, top, left, crop_h, crop_w, [self.size, self.size], antialias=True)
-        ir = TF.resized_crop(ir, top, left, crop_h, crop_w, [self.size, self.size], antialias=True)
-        dep = TF.resized_crop(dep, top, left, crop_h, crop_w, [self.size, self.size], antialias=True)
-        msk = TF.resized_crop(msk, top, left, crop_h, crop_w, [self.size, self.size], antialias=False)
+        # scale<1：窗口比原图大，补 0 到窗口尺寸（随机分配到四边，等价于随机平移）
+        pad_h, pad_w = max(0, win_h - h), max(0, win_w - w)
+        pad_top = random.randint(0, pad_h) if pad_h else 0
+        pad_left = random.randint(0, pad_w) if pad_w else 0
+        if pad_h or pad_w:
+            padding = [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top]  # l, t, r, b
+            vis, ir, dep, msk = (TF.pad(t, padding, fill=0) for t in (vis, ir, dep, msk))
+
+        # padding 后画布是 (max(h,win_h), max(w,win_w))，窗口一定放得下
+        top = random.randint(0, max(h, win_h) - win_h)
+        left = random.randint(0, max(w, win_w) - win_w)
+
+        out = list(self.size_hw)
+        vis = TF.resized_crop(vis, top, left, win_h, win_w, out, antialias=True)
+        ir = TF.resized_crop(ir, top, left, win_h, win_w, out, antialias=True)
+        dep = TF.resized_crop(dep, top, left, win_h, win_w, out, antialias=True)
+        msk = TF.resized_crop(msk, top, left, win_h, win_w, out, antialias=False)
 
         if boxes.numel():
+            # 原图像素 → padding 后画布 → 减去窗口原点，合并为单个偏移
+            off_x, off_y = pad_left - left, pad_top - top
             cx, cy, bw, bh = boxes.unbind(-1)
-            x1, y1 = (cx - bw / 2) * w, (cy - bh / 2) * h
-            x2, y2 = (cx + bw / 2) * w, (cy + bh / 2) * h
-            x1 = (x1 - left).clamp(0, crop_w)
-            x2 = (x2 - left).clamp(0, crop_w)
-            y1 = (y1 - top).clamp(0, crop_h)
-            y2 = (y2 - top).clamp(0, crop_h)
-            new_cx = (x1 + x2) / 2 / crop_w
-            new_cy = (y1 + y2) / 2 / crop_h
-            new_w = (x2 - x1) / crop_w
-            new_h = (y2 - y1) / crop_h
-            boxes = torch.stack([new_cx, new_cy, new_w, new_h], dim=-1)
+            x1, y1 = (cx - bw / 2) * w + off_x, (cy - bh / 2) * h + off_y
+            x2, y2 = (cx + bw / 2) * w + off_x, (cy + bh / 2) * h + off_y
+            x1, x2 = x1.clamp(0, win_w), x2.clamp(0, win_w)
+            y1, y2 = y1.clamp(0, win_h), y2.clamp(0, win_h)
+            boxes = torch.stack(
+                [(x1 + x2) / 2 / win_w, (y1 + y2) / 2 / win_h, (x2 - x1) / win_w, (y2 - y1) / win_h],
+                dim=-1,
+            )
 
         return vis, ir, dep, msk, boxes
 

@@ -3,12 +3,24 @@
 三个模态在磁盘上的实际格式（已用官方示例数据核实，18/18 组核心格式一致）：
 - visible : RGB uint8, 3ch, [0,255]
 - infrared: RGB uint8, 3ch（三通道冗余，取任一通道即为热辐射灰度）
-- depth   : PNG mode="I"（32bit 容器存 16bit 语义值），单位 mm，量程 [0, 19999]
-            0 或极小值代表无效深度区域（无 depth 反射，非"距离为 0"）
+- depth   : 两种格式并存，已在全量数据上统计+定标（见下）
 
-样例数据中发现 1 个例外（00000008.jpg 系列）：三模态均退化为 8bit JPEG，
-depth 被当成普通 RGB 图像存储而非真实深度值。这类样本深度通道不可信，
-读取时检测到非 "I" mode 会自动置全图为 invalid mask，不会静默产出错误的深度值。
+depth 的两种格式（训练集 2000 张 / 测试集 1000 张全量扫描）：
+
+  A) `.png` mode="I;16" —— 1851 张训练 / 845 张测试
+     单位 mm，量程 [0, 19999]，**值大 = 远**。0 代表无效（无反射，非"距离 0"）。
+     有效像素覆盖 69.3%，GT 框内有效像素 56.6%。
+
+  B) `.jpg` mode="RGB"（三通道完全相同的 8bit 灰度）—— 149 张训练 / 155 张测试
+     这批就是 640x360 的低分辨率子集。**不是坏文件**：234 个唯一值铺满 [0,255]，
+     且按行斜率 +26.6/箱，**值大 = 近**，已经处在视差/逆深度空间。
+     只在图像下 1/3 有效（上 2/3 精确为 0，传感器无覆盖），覆盖 26.3%，
+     GT 框内有效像素仅 14.3%。JPEG 有损压缩，存在块效应噪声。
+
+     历史坑：旧实现只认 mode 前缀 "I"，把 B 类整批判为 invalid 并全图置 0，
+     等于**丢掉了 15.5% 测试图的整条 depth 分支**。B 类的值已是逆深度语义，
+     与 preprocess_depth 对 A 类输出的 depth_norm（1=近）方向一致，因此只需
+     除以 255 归一化，**不能再套 1/d 反演**（会把方向反过来）。
 """
 
 from __future__ import annotations
@@ -36,28 +48,42 @@ def load_infrared(path: str) -> np.ndarray:
     return arr.astype(np.uint8)
 
 
-def load_depth_raw(path: str) -> tuple[np.ndarray, bool]:
-    """读取深度图原始 mm 值。
+DEPTH_KIND_MM16 = "mm16"    # A 类：16bit 毫米距离，值大=远
+DEPTH_KIND_DISP8 = "disp8"  # B 类：8bit 视差/逆深度，值大=近
+DEPTH_KIND_BAD = "bad"      # 真正无法解析
+
+
+def load_depth_raw(path: str) -> tuple[np.ndarray, str]:
+    """读取深度图原始值，并识别它属于哪种格式。
 
     Returns:
-        depth_mm: HxW int32/float，单位 mm。对非标准（退化为 RGB 的坏样本）格式，
-                   返回全零数组并标记 is_valid_format=False。
-        is_valid_format: 该文件是否为预期的单通道深度容器。
+        depth_raw: HxW int64。语义由 kind 决定，本函数不做任何数值变换。
+        kind: DEPTH_KIND_MM16 / DEPTH_KIND_DISP8 / DEPTH_KIND_BAD
     """
     img = Image.open(path)
     # Pillow 对单通道整型 PNG 按存储字节序细分 mode（"I"=32bit 有符号，
     # "I;16"/"I;16B"/"I;16L"/"I;16N" 等=16bit），真实数据集中的正常深度图
     # 实测是 "I;16"，不是 "I"——只匹配 "I" 会把全部正常样本误判为退化格式。
     if img.mode.startswith("I"):
-        depth_mm = np.array(img, dtype=np.int64)
-        return depth_mm, True
-    # 退化情况：depth 被存成了 RGB/L 等非深度容器格式，值不可信。
+        return np.array(img, dtype=np.int64), DEPTH_KIND_MM16
+
     arr = np.array(img)
+    if arr.ndim == 3:
+        # 三通道冗余的 8bit 灰度视差图。要求三通道一致才认，避免把真彩色图误判成深度。
+        if arr.shape[2] >= 3 and np.array_equal(arr[..., 0], arr[..., 1]) and np.array_equal(
+            arr[..., 1], arr[..., 2]
+        ):
+            return arr[..., 0].astype(np.int64), DEPTH_KIND_DISP8
+        h, w = arr.shape[:2]
+        return np.zeros((h, w), dtype=np.int64), DEPTH_KIND_BAD
+    if arr.ndim == 2 and arr.dtype == np.uint8:
+        return arr.astype(np.int64), DEPTH_KIND_DISP8
+
     h, w = arr.shape[:2]
-    return np.zeros((h, w), dtype=np.int64), False
+    return np.zeros((h, w), dtype=np.int64), DEPTH_KIND_BAD
 
 
-def preprocess_depth(depth_mm: np.ndarray, is_valid_format: bool) -> tuple[np.ndarray, np.ndarray]:
+def preprocess_depth(depth_raw: np.ndarray, kind: str) -> tuple[np.ndarray, np.ndarray]:
     """深度图预处理：掩码 + 截断 + 逆深度归一化。
 
     直接 d/65535 是错的：真实量程只占理论值域([0,65535])的 30%，
@@ -71,15 +97,23 @@ def preprocess_depth(depth_mm: np.ndarray, is_valid_format: bool) -> tuple[np.nd
         valid_mask: HxW float32 {0,1}，作为额外通道随 depth_norm 一起送入网络，
                     使模型可学习区分"近距离"和"无有效深度"两种语义。
     """
-    if not is_valid_format:
-        h, w = depth_mm.shape
+    if kind == DEPTH_KIND_BAD:
+        h, w = depth_raw.shape
         return (
             np.zeros((h, w), dtype=np.float32),
             np.zeros((h, w), dtype=np.float32),
         )
 
-    valid_mask = (depth_mm >= DEPTH_MIN_MM) & (depth_mm <= DEPTH_MAX_MM)
-    clipped = np.clip(depth_mm, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
+    if kind == DEPTH_KIND_DISP8:
+        # 已是逆深度空间（值大=近），与下面 mm16 分支输出的 depth_norm 方向一致，
+        # 直接线性归一化即可；再套 1/d 会把远近关系反过来。0 = 传感器无覆盖。
+        valid_mask = depth_raw > 0
+        depth_norm = (depth_raw.astype(np.float32) / 255.0).clip(0.0, 1.0)
+        depth_norm = np.where(valid_mask, depth_norm, 0.0).astype(np.float32)
+        return depth_norm, valid_mask.astype(np.float32)
+
+    valid_mask = (depth_raw >= DEPTH_MIN_MM) & (depth_raw <= DEPTH_MAX_MM)
+    clipped = np.clip(depth_raw, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
 
     inv_depth = 1.0 / clipped
     inv_min = 1.0 / DEPTH_MAX_MM
