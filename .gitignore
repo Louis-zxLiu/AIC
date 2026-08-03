@@ -20,3 +20,7 @@ __pycache__/
 
 # 本地临时诊断脚本（分辨率扫描 / submission 校验等），不入库
 _*.py
+
+# 提交产物：可由 infer.py 重新生成，不入库
+submit_*.zip
+submit_*/

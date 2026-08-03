@@ -84,6 +84,20 @@ def main():
     disp8_mode = args.disp8_mode or cfg.get("train", {}).get("disp8_mode", "use")
     print(f"[infer] image_size={infer_size} disp8_mode={disp8_mode}")
 
+    # 推理尺寸与训练尺寸不一致会大幅掉分，且每个权重的最优尺寸就是它自己的训练尺寸：
+    # 实测 run3（训练 736x1280）在 768 上只有 0.4511，回到 736x1280 是 0.5428（差 9.2 分）；
+    # run2（训练 640）反过来在 768 上最好。曾因此错误提交，线上从 54.78 掉到 51.507。
+    # 不要跨模型套用"某个尺寸是甜点"的结论——要改推理尺寸必须先在 val 上实测。
+    def _norm(s):
+        return tuple(s) if isinstance(s, (list, tuple)) else (s, s)
+
+    if _norm(infer_size) != _norm(cfg["image_size"]):
+        print(
+            f"[infer][警告] 推理尺寸 {infer_size} 与 config 训练尺寸 {cfg['image_size']} 不一致！\n"
+            f"[infer][警告] 除非你已在 val 上实测该尺寸更优，否则这通常会掉分（历史上曾因此丢 3.3 线上分）。",
+            flush=True,
+        )
+
     tf = SyncMultiModalTransform(size=infer_size, train=False)
     ds = MultiModalDetDataset(samples, tf, has_labels=False, disp8_mode=disp8_mode)
     loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=4, collate_fn=collate_fn)
