@@ -115,10 +115,16 @@ cd /root/aic && PYTHONPATH=/root/aic torchrun --nproc_per_node=2 --master_port=2
 | 11 | 0.5065 | | 31 | 0.5395 |
 | 13 | 0.5150 | | 33 | 0.5427 |
 | 15 | 0.5195 | | 35 | 0.5422 / 0.5425 |
-| 17 | 0.5227 | | 37 | **0.5430** ← 当前最佳 |
+| 17 | 0.5227 | | 37 | **0.5430 ← 最佳** |
 | 19 | 0.5249 | | 39 | 0.5425 |
+| | | | 41 | 0.5424 |
+| | | | 43 | 0.5419 |
+| | | | 45 | 0.5389 |
+| | | | 47 | 0.5386 |
 
-**收敛判断**：单调上升，尚未过拟合，e33 之后进入平台期（0.5427→0.5430，4 个 epoch 涨 0.0003）。
+**收敛判断**：单调上升到 e37 达峰 0.5430，之后小幅回落（e47 = 0.5386，回落 0.44 分）——
+**已收敛，末段轻微过拟合，但远不及 run2 的衰减幅度**。最佳点在 e37 而非最后一轮，
+所以提交必须用 `epoch37.pt`，不能用 `epoch47.pt`。
 epoch 35 有两个分数是因为崩溃后从 e33 重跑了一次 e35（见 §八），不是波动。
 
 **与上一版对比**：run2（`image_size: 640`）峰值在 e33 = 0.5159，之后衰减到 e47 = 0.5072。
@@ -129,15 +135,17 @@ run3 在同一 epoch 数上领先约 2.7 分，且没有出现 run2 的衰减。
 ## 六、推理命令（重要：推理尺寸与训练尺寸不同）
 
 ```bash
-cd /root/aic && PYTHONPATH=/root/aic python aic/tools/infer.py --config configs/dfine_tristream_hires.yml --checkpoint /root/autodl-tmp/outputs/run3_hires/epoch37.pt --test_root /root/autodl-tmp/dataset/测试集 --out_dir /root/autodl-tmp/submit_run3 --image_size 768 --zip_path /root/autodl-tmp/submit_run3.zip
+cd /root/aic && PYTHONPATH=/root/aic python aic/tools/infer.py --config configs/dfine_tristream_hires.yml --checkpoint /root/autodl-tmp/outputs/run3_hires/epoch37.pt --test_root /root/autodl-tmp/dataset/测试集 --out_dir /root/autodl-tmp/submit_run3_e37 --image_size 768 --disp8_mode use --zip_path /root/autodl-tmp/submit_run3_e37.zip
 ```
 
 | 设置 | 值 |
 |---|---|
 | 测试尺寸 | **768**（正方形）——**必须显式传 `--image_size 768`**，不传会用 config 的 `[736,1280]` |
+| `--disp8_mode` | **use** —— run3 配置未设 `disp8_mode`，训练走默认 `use`，即 8bit 视差图**参与了训练**，故推理也必须用 `use`。（`zero` 只用于复刻 run2 及更早权重的行为，那批权重是在 disp8 置零的输入上训的。传错约影响该子域 2.5 分。）|
 | 置信度阈值 | `inference.score_thresh: 0.05` |
 | 每图保留框数 | `inference.max_boxes: 100` |
-| 权重 | 用 **EMA** 权重（checkpoint 里的 `ema` 键） |
+| 权重 | **EMA**（`infer.py` 检测到 ckpt 含 `ema` 键会自动优先使用，无需额外参数）|
+| 测试集 | `/root/autodl-tmp/dataset/测试集`，1000 张 |
 
 **为什么推理用 768 而不是训练的 736×1280**：768 是实测的推理分辨率甜点。
 同一权重下整图 768 得 0.5370，而整图 1344 只有 0.4681 —— 往上放大同样掉分。
@@ -152,10 +160,15 @@ cd /root/aic && PYTHONPATH=/root/aic python aic/tools/infer.py --config configs/
 
 | 项目 | 值 |
 |---|---|
-| 提交文件路径 | *（待填）* |
+| 提交文件 | `submit_run3_e37.zip`（1000 个 txt，扁平结构无子目录，906 KB）|
+| 生成命令 | 见 §六 |
 | 线上分数 | *（待填）* |
-| 对应 checkpoint | `run3_hires/epoch37.pt` |
-| 对应本地验证分数 | 0.5430 |
+| 对应 checkpoint | `run3_hires/epoch37.pt`（EMA 权重）|
+| 对应本地验证分数 | **0.5430** |
+
+提交文件自检（已通过）：1000 个文件、无空文件、59330 个框（每图均 59.3、上限 100）、
+坐标全部在 [0,1] 内、置信度 0.05~0.971。高置信度（≥0.5）框共 4318 个，每图 4.3 个，
+其类别分布与训练集先验一致（无类别崩塌）。
 
 上一版 run2 的线上分数请以队友记录为准（示例中提到 53.666 量级）。
 **注意 run2 与 run3 的 fold 划分相同（fold 0, seed 42），分数可直接比较。**
