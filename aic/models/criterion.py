@@ -72,9 +72,9 @@ class MALCriterion(DFINECriterion):
             # complementary term still discourages overconfident predictions.
             row, col = idx
             q_gamma = q.pow(gamma)
-            losses[row, target_labels] = (
-                -q_gamma * log_p[row, target_labels]
-                -(1.0 - q_gamma) * log_not_p[row, target_labels]
+            losses[row, col, target_labels] = (
+                -q_gamma * log_p[row, col, target_labels]
+                -(1.0 - q_gamma) * log_not_p[row, col, target_labels]
             )
 
         loss = losses.mean(1).sum() * src_logits.shape[1] / num_boxes

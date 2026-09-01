@@ -91,6 +91,26 @@ def resolved_config(base_config: str, out_config: str, ir_ckpt: Path, depth_ckpt
     )
 
 
+def resolved_baseline(out_config: str, ir_ckpt: Path, depth_ckpt: Path) -> None:
+    """Create the same-epoch control used by the 60.53 ablation.
+
+    It keeps the original cosine schedule and augmentation, while using the
+    newly selected teachers and 64 epochs so the comparison has one variable:
+    DEIM schedule or MAL versus this control.
+    """
+    cfg = yaml.safe_load(
+        (ROOT / "configs/dfine_tristream_x_m2d_pkd_nocross_fold0_48_control.yml")
+        .read_text(encoding="utf-8")
+    )
+    cfg["train"]["epochs"] = 64
+    cfg["train"]["save_dir"] = str(ROOT / "outputs/run_x_m2d_pkd_nocross_baseline_fold0_64")
+    cfg["distill"]["ir_teacher_ckpt"] = str(ir_ckpt)
+    cfg["distill"]["depth_teacher_ckpt"] = str(depth_ckpt)
+    (ROOT / out_config).write_text(
+        yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+
+
 def run_infer(config: str, out_dir: Path, epoch: int, tag: str) -> str:
     checkpoint = out_dir / f"epoch{epoch}.pt"
     pred_dir = ROOT / "outputs" / f"{tag}_pred_epoch{epoch}"
@@ -149,5 +169,27 @@ for base_config, tag in [
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print("[result]", tag, result, flush=True)
+
+# Run the direct 64-epoch control only after both recipe ablations have
+# completed.  This makes the comparison fair even if a later run is resumed.
+baseline_config = "automation/dfine_tristream_x_m2d_pkd_nocross_baseline_fold0_64_resolved.yml"
+resolved_baseline(baseline_config, ir_ckpt, depth_ckpt)
+run_train(baseline_config)
+baseline_out = Path(yaml.safe_load((ROOT / baseline_config).read_text(encoding="utf-8"))["train"]["save_dir"])
+baseline_ep, baseline_val = best_eval(baseline_out)
+baseline_zip = run_infer(baseline_config, baseline_out, baseline_ep, "deim_baseline")
+baseline_result = {
+    "best_epoch": baseline_ep,
+    "val_map_50_95": baseline_val,
+    "zip": baseline_zip,
+    "ir_teacher_epoch": ir_ep,
+    "ir_teacher_map": ir_map,
+    "depth_teacher_epoch": depth_ep,
+    "depth_teacher_map": depth_map,
+}
+(AUTO / "deim_baseline_result.json").write_text(
+    json.dumps(baseline_result, ensure_ascii=False, indent=2), encoding="utf-8"
+)
+print("[result] deim_baseline", baseline_result, flush=True)
 
 (AUTO / "deim_sequence.done").write_text(time.strftime("%F %T"), encoding="utf-8")
