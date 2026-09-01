@@ -17,6 +17,8 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 
+from .modalities import DEPTH_KIND_DISP8, DEPTH_KIND_MM16
+
 
 class SyncMultiModalTransform:
     def __init__(
@@ -29,6 +31,7 @@ class SyncMultiModalTransform:
         final_scale_range: tuple[float, float] = (0.9, 1.1),
         stop_decay_epoch_ratio: float = 0.8,
         total_epochs: int = 1,
+        no_aug_epoch: int | None = None,
         min_box_px: float = 2.0,
     ):
         # size 支持 int（方形）或 (h, w)（矩形）。数据集全是 16:9，方形 resize 会带来
@@ -44,9 +47,12 @@ class SyncMultiModalTransform:
         self.scale_range = scale_range
         self.base_modality_dropout_p = modality_dropout_p
         self.modality_dropout_p = modality_dropout_p
+        self.base_hflip_p = hflip_p
         self.final_scale_range = final_scale_range
         self.stop_decay_epoch_ratio = stop_decay_epoch_ratio
         self.total_epochs = max(total_epochs, 1)
+        self.no_aug_epoch = no_aug_epoch
+        self.photometric_enabled = True
 
     def set_epoch(self, epoch: int) -> None:
         """算法设计.md §3.5：训练末段（默认最后 20% epoch）渐进关闭强增强，
@@ -55,6 +61,17 @@ class SyncMultiModalTransform:
         收紧到 final_scale_range，modality_dropout_p 线性退火到 0，使模型
         在收尾阶段用完整三模态输入定型。
         """
+        # DEIM-style close-out: the last epochs use deployment geometry only.
+        # Keep this separate from the normal linear decay for clean ablations.
+        self.hflip_p = self.base_hflip_p
+        self.photometric_enabled = True
+        if self.no_aug_epoch is not None and epoch >= self.no_aug_epoch:
+            self.scale_range = (1.0, 1.0)
+            self.modality_dropout_p = 0.0
+            self.hflip_p = 0.0
+            self.photometric_enabled = False
+            return
+
         decay_start = self.stop_decay_epoch_ratio * self.total_epochs
         if epoch < decay_start or self.total_epochs <= decay_start:
             self.scale_range = self.base_scale_range
@@ -73,6 +90,8 @@ class SyncMultiModalTransform:
         infrared: np.ndarray,  # HxW uint8
         depth_norm: np.ndarray,   # HxW float32 [0,1]
         valid_mask: np.ndarray,   # HxW float32 {0,1}
+        quality_mask: np.ndarray,  # HxW float32 [0,1]
+        depth_kind: str,
         boxes_cxcywh: np.ndarray,  # Nx4 normalized [0,1], DETR convention
         labels: np.ndarray,       # N,
     ):
@@ -82,19 +101,24 @@ class SyncMultiModalTransform:
         ir = torch.from_numpy(infrared).float().unsqueeze(0) / 255.0   # 1,H,W
         dep = torch.from_numpy(depth_norm).unsqueeze(0)                # 1,H,W
         msk = torch.from_numpy(valid_mask).unsqueeze(0)                # 1,H,W
+        quality = torch.from_numpy(quality_mask).unsqueeze(0)          # 1,H,W
 
         boxes = torch.from_numpy(boxes_cxcywh.copy()) if boxes_cxcywh.size else torch.zeros((0, 4))
         labels_t = torch.from_numpy(labels.copy()).long() if labels.size else torch.zeros((0,), dtype=torch.long)
 
         if self.train:
-            vis, ir, dep, msk, boxes = self._random_resized_crop(vis, ir, dep, msk, boxes)
+            vis, ir, dep, msk, quality, boxes = self._random_resized_crop(
+                vis, ir, dep, msk, quality, boxes
+            )
             if random.random() < self.hflip_p:
-                vis, ir, dep, msk = (TF.hflip(t) for t in (vis, ir, dep, msk))
+                vis, ir, dep, msk, quality = (
+                    TF.hflip(t) for t in (vis, ir, dep, msk, quality)
+                )
                 if boxes.numel():
                     boxes[:, 0] = 1.0 - boxes[:, 0]
             vis = self._photometric(vis)
         else:
-            vis, ir, dep, msk = self._resize_only(vis, ir, dep, msk)
+            vis, ir, dep, msk, quality = self._resize_only(vis, ir, dep, msk, quality)
 
         if self.train and boxes.numel():
             # 阈值按输出像素算，不用归一化常数：旧的 1e-4 归一化 ≈ 0.06px，形同没过滤，
@@ -105,31 +129,45 @@ class SyncMultiModalTransform:
             boxes = boxes[keep]
             labels_t = labels_t[keep]
 
+        ir_distill_valid = 1.0
+        depth_distill_valid = float(msk.any())
         if self.train and random.random() < self.modality_dropout_p:
             if random.random() < 0.5:
                 ir = torch.zeros_like(ir)
+                ir_distill_valid = 0.0
             else:
                 dep = torch.zeros_like(dep)
                 msk = torch.zeros_like(msk)
+                quality = torch.zeros_like(quality)
+                depth_distill_valid = 0.0
 
-        depth_stack = torch.cat([dep, msk], dim=0)  # 2,H,W
+        mm16 = torch.full_like(dep, float(depth_kind == DEPTH_KIND_MM16))
+        disp8 = torch.full_like(dep, float(depth_kind == DEPTH_KIND_DISP8))
+        if depth_distill_valid == 0.0:
+            mm16.zero_()
+            disp8.zero_()
+        quality = quality.clamp(0.0, 1.0) * msk
+        depth_stack = torch.cat([dep, msk, mm16, disp8, quality], dim=0)
 
         target = {
             "labels": labels_t,
             "boxes": boxes.float(),
             "orig_size": torch.tensor([w0, h0], dtype=torch.float32),
+            "ir_distill_valid": torch.tensor(ir_distill_valid, dtype=torch.float32),
+            "depth_distill_valid": torch.tensor(depth_distill_valid, dtype=torch.float32),
         }
         return vis, ir, depth_stack, target
 
-    def _resize_only(self, vis, ir, dep, msk):
+    def _resize_only(self, vis, ir, dep, msk, quality):
         out = list(self.size_hw)
         vis = TF.resize(vis, out, antialias=True)
         ir = TF.resize(ir, out, antialias=True)
         dep = TF.resize(dep, out, antialias=True)
         msk = TF.resize(msk, out, antialias=False)
-        return vis, ir, dep, msk
+        quality = TF.resize(quality, out, antialias=True)
+        return vis, ir, dep, msk, quality
 
-    def _random_resized_crop(self, vis, ir, dep, msk, boxes):
+    def _random_resized_crop(self, vis, ir, dep, msk, quality, boxes):
         """scale>1 放大（裁小窗口），scale<1 缩小（先 zero-pad 出更大画布再取窗口）。
 
         旧实现用 `crop_h = min(h, int(h / scale))`，scale<1 时 int(h/scale) > h，被
@@ -149,7 +187,9 @@ class SyncMultiModalTransform:
         pad_left = random.randint(0, pad_w) if pad_w else 0
         if pad_h or pad_w:
             padding = [pad_left, pad_top, pad_w - pad_left, pad_h - pad_top]  # l, t, r, b
-            vis, ir, dep, msk = (TF.pad(t, padding, fill=0) for t in (vis, ir, dep, msk))
+            vis, ir, dep, msk, quality = (
+                TF.pad(t, padding, fill=0) for t in (vis, ir, dep, msk, quality)
+            )
 
         # padding 后画布是 (max(h,win_h), max(w,win_w))，窗口一定放得下
         top = random.randint(0, max(h, win_h) - win_h)
@@ -160,6 +200,7 @@ class SyncMultiModalTransform:
         ir = TF.resized_crop(ir, top, left, win_h, win_w, out, antialias=True)
         dep = TF.resized_crop(dep, top, left, win_h, win_w, out, antialias=True)
         msk = TF.resized_crop(msk, top, left, win_h, win_w, out, antialias=False)
+        quality = TF.resized_crop(quality, top, left, win_h, win_w, out, antialias=True)
 
         if boxes.numel():
             # 原图像素 → padding 后画布 → 减去窗口原点，合并为单个偏移
@@ -174,9 +215,11 @@ class SyncMultiModalTransform:
                 dim=-1,
             )
 
-        return vis, ir, dep, msk, boxes
+        return vis, ir, dep, msk, quality, boxes
 
     def _photometric(self, vis: torch.Tensor) -> torch.Tensor:
+        if not self.photometric_enabled:
+            return vis
         if random.random() < 0.8:
             vis = TF.adjust_brightness(vis, random.uniform(0.7, 1.3))
         if random.random() < 0.8:

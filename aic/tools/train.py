@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import os
+import random
 import re
 import time
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
@@ -36,7 +39,11 @@ from aic.data.dataset import (
     scan_samples,
 )
 from aic.data.transforms import SyncMultiModalTransform
-from aic.models.tristream_dfine import build_tristream_dfine
+from aic.models.criterion import GCDCriterion, MALCriterion
+from aic.models.distill import DINOv2RGBFeatureDistillLoss, M2DDistillLoss, TriStreamSelfDistillLoss
+from aic.models.matcher import GCDHungarianMatcher, SNL1HungarianMatcher
+from aic.models.backbone import TriStreamHGNetv2
+from aic.models.tristream_dfine import build_single_modality_dfine, build_tristream_dfine
 from aic.utils.curves import CurveLogger
 from third_party_dfine import DFINECriterion, HungarianMatcher
 
@@ -64,7 +71,13 @@ def setup_distributed() -> tuple[int, int, int]:
     return rank, world_size, local_rank
 
 
-def build_param_groups(model, lr: float, backbone_lr_mult: float, weight_decay: float):
+def build_param_groups(
+    model,
+    lr: float,
+    backbone_lr_mult: float,
+    weight_decay: float,
+    freqfusion_lr_mult: float = 1.0,
+):
     """四路参数分组（算法设计.md §3.2/§3.3）：
     1. 预训练骨干（stem_rgb + stages）非 norm 参数 —— lr*backbone_lr_mult, weight_decay
     2. 预训练骨干 norm/bias 参数                    —— lr*backbone_lr_mult, weight_decay=0
@@ -89,13 +102,24 @@ def build_param_groups(model, lr: float, backbone_lr_mult: float, weight_decay: 
     inner = model.module if hasattr(model, "module") else model
     pretrained_ids = inner.backbone.pretrained_param_ids
 
-    groups = {"pretrained": [], "pretrained_norm": [], "new": [], "new_norm": []}
+    groups = {
+        "pretrained": [],
+        "pretrained_norm": [],
+        "new": [],
+        "new_norm": [],
+        "freqfusion": [],
+        "freqfusion_norm": [],
+    }
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         is_pretrained = id(p) in pretrained_ids
         is_norm_or_bias = id(p) in norm_param_ids or name.endswith(".bias")
-        key = ("pretrained" if is_pretrained else "new") + ("_norm" if is_norm_or_bias else "")
+        is_freqfusion = "freq_fusions" in name or "freqfusion_gates" in name
+        if is_freqfusion:
+            key = "freqfusion_norm" if is_norm_or_bias else "freqfusion"
+        else:
+            key = ("pretrained" if is_pretrained else "new") + ("_norm" if is_norm_or_bias else "")
         groups[key].append(p)
 
     param_groups = [
@@ -103,6 +127,8 @@ def build_param_groups(model, lr: float, backbone_lr_mult: float, weight_decay: 
         {"params": groups["pretrained_norm"], "lr": lr * backbone_lr_mult, "weight_decay": 0.0},
         {"params": groups["new"], "lr": lr, "weight_decay": weight_decay},
         {"params": groups["new_norm"], "lr": lr, "weight_decay": 0.0},
+        {"params": groups["freqfusion"], "lr": lr * freqfusion_lr_mult, "weight_decay": weight_decay},
+        {"params": groups["freqfusion_norm"], "lr": lr * freqfusion_lr_mult, "weight_decay": 0.0},
     ]
     return [g for g in param_groups if g["params"]]
 
@@ -154,10 +180,48 @@ def move_targets_to_device(targets, device):
     return out
 
 
+def apply_student_modality_dropout(
+    ir: torch.Tensor,
+    depth: torch.Tensor,
+    probability: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Drop IR or Depth per sample while preserving clean tensors for a teacher."""
+    if probability <= 0.0:
+        return ir, depth, ir.new_zeros(())
+    batch_size = ir.shape[0]
+    drop = torch.rand(batch_size, device=ir.device) < probability
+    drop_ir = drop & (torch.rand(batch_size, device=ir.device) < 0.5)
+    drop_depth = drop & ~drop_ir
+    student_ir = ir.clone()
+    student_depth = depth.clone()
+    student_ir[drop_ir] = 0
+    student_depth[drop_depth] = 0
+    return student_ir, student_depth, drop.float().mean()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--warm_start_model",
+        default=None,
+        help="Load model/EMA weights only, then create a fresh optimizer and scheduler.",
+    )
+    parser.add_argument(
+        "--mono_modality",
+        default=None,
+        choices=["rgb", "ir", "depth"],
+        help="计划.md §2.8 M²D-LIF linear probing 诊断专用：只用单一模态训练，"
+        "backbone 走 SingleModalityDFINE（无 OPF），不设置时走正常三流训练",
+    )
+    parser.add_argument(
+        "--frozen_backbone_ckpt",
+        default=None,
+        help="--mono_modality 探针模式：从该 checkpoint 加载 backbone 权重并冻结，"
+        "只训练 encoder/decoder。不设置时 backbone 从预训练权重正常初始化并参与训练"
+        "（单模态基线模式）。仅在设置了 --mono_modality 时生效",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -167,6 +231,14 @@ def main():
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     train_cfg = cfg["train"]
+    self_distill_cfg = cfg.get("self_distill") if not args.mono_modality else None
+    seed = int(train_cfg.get("seed", 42))
+    process_seed = seed + rank
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
     save_dir = train_cfg["save_dir"]
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
@@ -174,19 +246,40 @@ def main():
     curve_logger = CurveLogger(save_dir) if is_main_process() else None
 
     samples = scan_samples(train_cfg["data_root"], require_labels=True)
-    train_samples, val_samples = kfold_split(samples, n_folds=train_cfg["n_folds"], fold=train_cfg["fold"])
+    if train_cfg.get("full_data", False):
+        train_samples, val_samples = samples, []
+    else:
+        train_samples, val_samples = kfold_split(samples, n_folds=train_cfg["n_folds"], fold=train_cfg["fold"])
+    has_val = len(val_samples) > 0
     if is_main_process():
         print(f"[data] train={len(train_samples)} val={len(val_samples)} total={len(samples)}")
 
     train_tf = SyncMultiModalTransform(
         size=cfg["image_size"],
         train=True,
-        modality_dropout_p=train_cfg["modality_dropout_p"],
+        # Self-distillation needs a clean copy for the static teacher. Its
+        # student-only modality dropout is applied on GPU in the train loop.
+        modality_dropout_p=0.0 if self_distill_cfg else train_cfg["modality_dropout_p"],
+        scale_range=tuple(train_cfg.get("scale_range", [0.5, 1.5])),
+        final_scale_range=tuple(train_cfg.get("final_scale_range", [0.9, 1.1])),
+        stop_decay_epoch_ratio=float(train_cfg.get("stop_decay_epoch_ratio", 0.8)),
         total_epochs=train_cfg["epochs"],
+        no_aug_epoch=(
+            int(train_cfg["no_aug_epoch"])
+            if train_cfg.get("no_aug_epoch") is not None
+            else None
+        ),
     )
     val_tf = SyncMultiModalTransform(size=cfg["image_size"], train=False)
     disp8_mode = train_cfg.get("disp8_mode", "use")
-    train_ds = MultiModalDetDataset(train_samples, train_tf, has_labels=True, disp8_mode=disp8_mode)
+    dataset_distill_cfg = cfg.get("distill", {}) if not args.mono_modality else {}
+    confidence_args = {
+        "ir_confidence_cache": dataset_distill_cfg.get("ir_confidence_cache"),
+        "depth_confidence_cache": dataset_distill_cfg.get("depth_confidence_cache"),
+    }
+    train_ds = MultiModalDetDataset(
+        train_samples, train_tf, has_labels=True, disp8_mode=disp8_mode, **confidence_args
+    )
     val_ds = MultiModalDetDataset(val_samples, val_tf, has_labels=True, disp8_mode=disp8_mode)
 
     # 类别不均衡重采样（算法设计.md §3.4，计划.md §2.4 tier 1）：ClassBalancedDataset
@@ -215,6 +308,8 @@ def main():
     else:
         train_collate = collate_fn
 
+    train_generator = torch.Generator()
+    train_generator.manual_seed(process_seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=train_cfg["batch_size"],
@@ -224,18 +319,171 @@ def main():
         collate_fn=train_collate,
         drop_last=True,
         pin_memory=True,
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_ds, batch_size=1, shuffle=False, num_workers=2, collate_fn=collate_fn
     )
 
-    model = build_tristream_dfine(cfg).to(device)
+    if args.mono_modality:
+        frozen_bb = None
+        if args.frozen_backbone_ckpt:
+            bb_cfg = cfg["backbone"]
+            frozen_bb = TriStreamHGNetv2(
+                name=bb_cfg["name"],
+                use_lab=bb_cfg.get("use_lab", False),
+                return_idx=tuple(bb_cfg.get("return_idx", [1, 2, 3])),
+                pretrained=False,
+                share_stages=bb_cfg.get("share_stages", True),
+                depth_in_chs=bb_cfg.get("depth_in_chs", 2),
+            )
+            state = torch.load(args.frozen_backbone_ckpt, map_location="cpu")["model"]
+            bb_state = {k[len("backbone.") :]: v for k, v in state.items() if k.startswith("backbone.")}
+            if "stages.0.blocks.0.layers.0.conv.weight" in bb_state and frozen_bb.share_stages:
+                # 兼容旧 checkpoint（backbone.py 重构前保存的），当时共享 stages
+                # 只用一个扁平的 `stages` 属性名注册，新代码里 share_stages=True
+                # 仍是同一份权重，只是分别注册在 stages_rgb/stages_ir/stages_depth
+                # 三个属性名下（state_dict 按注册名展开，即使三者指向同一对象）。
+                for k in [k for k in bb_state if k.startswith("stages.")]:
+                    suffix = k[len("stages.") :]
+                    v = bb_state.pop(k)
+                    bb_state[f"stages_rgb.{suffix}"] = v
+                    bb_state[f"stages_ir.{suffix}"] = v
+                    bb_state[f"stages_depth.{suffix}"] = v
+            frozen_bb.load_state_dict(bb_state)
+            if is_main_process():
+                print(f"[probe] loaded frozen backbone from {args.frozen_backbone_ckpt}, {len(bb_state)} tensors")
+        model = build_single_modality_dfine(cfg, args.mono_modality, frozen_bb).to(device)
+    else:
+        model = build_tristream_dfine(cfg).to(device)
+
+    if args.warm_start_model:
+        warm_state = torch.load(args.warm_start_model, map_location="cpu", weights_only=False)
+        if isinstance(warm_state, dict) and warm_state.get("ema") is not None:
+            warm_state = warm_state["ema"]
+        elif isinstance(warm_state, dict) and "model" in warm_state:
+            warm_state = warm_state["model"]
+        warm_result = model.load_state_dict(warm_state, strict=False)
+        if is_main_process():
+            print(
+                f"[warm-start] loaded {args.warm_start_model}; "
+                f"missing={len(warm_result.missing_keys)} unexpected={len(warm_result.unexpected_keys)}"
+            )
+
+    # M2D 蒸馏（计划.md §2.8 后续，memory `fusion-degradation-confirmed`）：只在
+    # config 里配置了 distill 段时启用，不配置就是原来的行为，与旧 config 完全
+    # 兼容。只对三流联合训练生效——mono_modality 探针本身就是诊断/teacher 训练
+    # 用的，不需要也不应该被蒸馏。
+    distill_cfg = cfg.get("distill") if not args.mono_modality else None
+    distill_loss_fn = None
+    if distill_cfg:
+        distill_loss_fn = M2DDistillLoss(
+            bb_cfg=cfg["backbone"],
+            ir_teacher_ckpt=distill_cfg["ir_teacher_ckpt"],
+            depth_teacher_ckpt=distill_cfg["depth_teacher_ckpt"],
+            weight=distill_cfg.get("weight", 1.0),
+            ir_weight=distill_cfg.get("ir_weight", 1.0),
+            depth_weight=distill_cfg.get("depth_weight", 1.0),
+            use_teacher_ema=distill_cfg.get("use_teacher_ema", False),
+            foreground_weight=distill_cfg.get("foreground_weight", 1.0),
+            level_weights=distill_cfg.get("level_weights"),
+            use_depth_valid_mask=distill_cfg.get("use_depth_valid_mask", False),
+            cross_weight=distill_cfg.get("cross_weight", 1.0),
+            use_adapters=distill_cfg.get("use_adapters", True),
+            adapter_reduction=distill_cfg.get("adapter_reduction", 16),
+            dynamic_reliability=distill_cfg.get("dynamic_reliability", False),
+            reliability_floor=distill_cfg.get("reliability_floor", 0.25),
+            reliability_power=distill_cfg.get("reliability_power", 1.0),
+            method=distill_cfg.get("method", "pkd_lcm"),
+        ).to(device)
+        if is_main_process():
+            print(
+                f"[distill] M2D 蒸馏已启用，weight={distill_cfg.get('weight', 1.0)} "
+                f"ir_weight={distill_loss_fn.ir_weight} "
+                f"depth_weight={distill_loss_fn.depth_weight} "
+                f"teacher={distill_loss_fn.ir_teacher_source}/{distill_loss_fn.depth_teacher_source} "
+                f"foreground_weight={distill_loss_fn.foreground_weight} "
+                f"level_weights={distill_loss_fn.level_weights} "
+                f"depth_valid_mask={distill_loss_fn.use_depth_valid_mask} "
+                f"method={distill_loss_fn.method} "
+                f"cross_weight={distill_loss_fn.cross_weight} "
+                f"use_adapters={distill_loss_fn.use_adapters} "
+                f"dynamic_reliability={distill_loss_fn.dynamic_reliability} "
+                f"decay_start_epoch={distill_cfg.get('decay_start_epoch', 'none')} "
+                f"final_scale={distill_cfg.get('final_scale', 1.0)}"
+            )
+
+    dino_cfg = cfg.get("dino_distill") if not args.mono_modality else None
+    dino_loss_fn = None
+    if dino_cfg:
+        dino_loss_fn = DINOv2RGBFeatureDistillLoss(
+            checkpoint_dir=dino_cfg["checkpoint_dir"],
+            student_channels=tuple(model.backbone.out_channels),
+            weight=dino_cfg.get("weight", 0.5),
+            foreground_weight=dino_cfg.get("foreground_weight", 2.0),
+            level_weights=tuple(dino_cfg.get("level_weights", [0.0, 1.0, 1.0])),
+            patch_size=dino_cfg.get("patch_size", 14),
+        ).to(device)
+        if is_main_process():
+            print(
+                f"[distill] DINOv2 RGB teacher enabled, weight={dino_loss_fn.weight} "
+                f"foreground_weight={dino_loss_fn.foreground_weight} "
+                f"level_weights={dino_loss_fn.level_weights} "
+                f"warmup_epochs={dino_cfg.get('warmup_epochs', 0)}"
+            )
+
+    self_distill_loss_fn = None
+    if self_distill_cfg:
+        if distill_loss_fn is not None or dino_loss_fn is not None:
+            raise ValueError("self_distill must be isolated from M2D and DINO distillation")
+        self_distill_loss_fn = TriStreamSelfDistillLoss(
+            model_cfg=cfg,
+            teacher_ckpt=self_distill_cfg["teacher_ckpt"],
+            use_teacher_ema=self_distill_cfg.get("use_teacher_ema", True),
+            cls_weight=self_distill_cfg.get("cls_weight", 2.0),
+            bbox_weight=self_distill_cfg.get("bbox_weight", 5.0),
+            giou_weight=self_distill_cfg.get("giou_weight", 2.0),
+            temperature=self_distill_cfg.get("temperature", 2.0),
+            teacher_score_thresh=self_distill_cfg.get("teacher_score_thresh", 0.25),
+            teacher_gt_iou_thresh=self_distill_cfg.get("teacher_gt_iou_thresh", 0.5),
+        ).to(device)
+        if is_main_process():
+            print(
+                f"[self-distill] static tri-stream teacher enabled: "
+                f"{self_distill_loss_fn.teacher_ckpt} ({self_distill_loss_fn.teacher_source}); "
+                f"weights=cls:{self_distill_loss_fn.cls_weight},"
+                f"bbox:{self_distill_loss_fn.bbox_weight},giou:{self_distill_loss_fn.giou_weight}; "
+                f"temperature={self_distill_loss_fn.temperature} "
+                f"score_thresh={self_distill_loss_fn.teacher_score_thresh} "
+                f"gt_iou_thresh={self_distill_loss_fn.teacher_gt_iou_thresh}"
+            )
 
     if world_size > 1 and torch.cuda.is_available():
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 
-    matcher = HungarianMatcher(**cfg["matcher"])
-    criterion = DFINECriterion(matcher=matcher, num_classes=cfg["num_classes"], **cfg["criterion"]).to(device)
+    matcher_cfg = dict(cfg["matcher"])
+    cost_type = matcher_cfg.pop("cost_type", "base")
+    if cost_type == "base":
+        matcher = HungarianMatcher(**matcher_cfg)
+    elif cost_type == "gcd":
+        matcher = GCDHungarianMatcher(**matcher_cfg, cost_type=cost_type)
+    else:
+        matcher = SNL1HungarianMatcher(**matcher_cfg, cost_type=cost_type, image_size=cfg["image_size"])
+    criterion_type = str(cfg.get("criterion_type", "dfine")).lower()
+    if criterion_type == "mal":
+        criterion_cls = MALCriterion
+    elif criterion_type == "gcd" or (criterion_type == "dfine" and cost_type == "gcd"):
+        criterion_cls = GCDCriterion
+    elif criterion_type == "dfine":
+        criterion_cls = DFINECriterion
+    else:
+        raise ValueError(f"unsupported criterion_type: {criterion_type!r}")
+    criterion_cfg = dict(cfg["criterion"])
+    criterion = criterion_cls(
+        matcher=matcher,
+        num_classes=cfg["num_classes"],
+        **criterion_cfg,
+    ).to(device)
 
     if world_size > 1:
         # find_unused_parameters=True: 模态 dropout 会让某些 iteration 里 IR 或 Depth 的
@@ -254,11 +502,42 @@ def main():
         )
 
     param_groups = build_param_groups(
-        model, train_cfg["lr"], train_cfg["backbone_lr_mult"], train_cfg["weight_decay"]
+        model,
+        train_cfg["lr"],
+        train_cfg["backbone_lr_mult"],
+        train_cfg["weight_decay"],
+        freqfusion_lr_mult=float(train_cfg.get("freqfusion_lr_mult", 1.0)),
     )
+    distill_params = []
+    if distill_loss_fn is not None:
+        distill_params = [p for p in distill_loss_fn.parameters() if p.requires_grad]
+        if distill_params:
+            param_groups.append(
+                {"params": distill_params, "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]}
+            )
+    dino_params = []
+    if dino_loss_fn is not None:
+        dino_params = [p for p in dino_loss_fn.parameters() if p.requires_grad]
+        if dino_params:
+            param_groups.append(
+                {"params": dino_params, "lr": train_cfg["lr"], "weight_decay": train_cfg["weight_decay"]}
+            )
     optimizer = torch.optim.AdamW(param_groups)
+    auxiliary_params = distill_params + dino_params
+    clip_params = list(model.parameters()) + auxiliary_params
 
     grad_accum = train_cfg["grad_accum_steps"]
+
+    # Read the resume metadata once.  Besides avoiding a second 1.6GB checkpoint
+    # load, this lets the scheduler keep the original optimizer-step density when
+    # resuming with a different DDP world size (for example, 2 -> 4 GPUs).
+    resume_probe = None
+    resume_scheduler_step = None
+    resume_epoch = None
+    if args.resume and os.path.exists(args.resume):
+        resume_probe = torch.load(args.resume, map_location="cpu")
+        resume_scheduler_step = int(resume_probe.get("scheduler", {}).get("last_epoch", -1))
+        resume_epoch = int(resume_probe.get("epoch", -1))
 
     # 关键：scheduler.step() 只在梯度累积边界被调用（见训练循环），所以调度器
     # 的 step 计数单位是 **optimizer step**，不是 dataloader step。这里必须除以
@@ -268,15 +547,88 @@ def main():
     # steps_per_epoch 是 optimizer step 数（调度器单位）；dataloader_steps 是
     # 实际迭代次数，仅用于日志进度显示。两者相差 grad_accum 倍。
     dataloader_steps = len(train_loader)
+    dino_warmup_steps = (
+        int(float(dino_cfg.get("warmup_epochs", 0)) * dataloader_steps)
+        if dino_cfg is not None
+        else 0
+    )
+    distill_decay_start = int(distill_cfg.get("decay_start_epoch", train_cfg["epochs"])) if distill_cfg else train_cfg["epochs"]
+    distill_final_scale = float(distill_cfg.get("final_scale", 1.0)) if distill_cfg else 1.0
+    if not 0.0 <= distill_final_scale <= 1.0:
+        raise ValueError("distill.final_scale must be in [0, 1]")
+    if not 0 <= distill_decay_start < train_cfg["epochs"] and distill_final_scale != 1.0:
+        raise ValueError("distill.decay_start_epoch must be within the training schedule")
+
+    self_distill_start = int(self_distill_cfg.get("start_epoch", 4)) if self_distill_cfg else 0
+    self_distill_ramp = float(self_distill_cfg.get("ramp_epochs", 4.0)) if self_distill_cfg else 0.0
+    self_distill_decay = float(self_distill_cfg.get("decay_start_epoch", 36.0)) if self_distill_cfg else 0.0
+    self_distill_stop = float(self_distill_cfg.get("stop_epoch", 40.0)) if self_distill_cfg else 0.0
+    self_distill_peak = float(self_distill_cfg.get("peak_scale", 1.0)) if self_distill_cfg else 0.0
+    student_dropout_p = float(self_distill_cfg.get("student_modality_dropout_p", 0.1)) if self_distill_cfg else 0.0
+    student_dropout_stop = float(self_distill_cfg.get("student_dropout_stop_epoch", self_distill_stop)) if self_distill_cfg else 0.0
+    if self_distill_cfg:
+        if not 0 <= self_distill_start < train_cfg["epochs"]:
+            raise ValueError("self_distill.start_epoch must be within the training schedule")
+        if not self_distill_start + self_distill_ramp <= self_distill_decay < self_distill_stop <= train_cfg["epochs"]:
+            raise ValueError("self_distill schedule must satisfy start+ramp <= decay < stop <= epochs")
+        if self_distill_peak < 0 or not 0.0 <= student_dropout_p <= 1.0:
+            raise ValueError("invalid self_distill peak scale or student modality dropout")
+
+    def self_distill_scale(epoch_value: int, step_value: int) -> float:
+        if self_distill_loss_fn is None:
+            return 0.0
+        position = epoch_value + step_value / max(dataloader_steps, 1)
+        if position < self_distill_start:
+            return 0.0
+        if self_distill_ramp > 0 and position < self_distill_start + self_distill_ramp:
+            return self_distill_peak * (position - self_distill_start) / self_distill_ramp
+        if position < self_distill_decay:
+            return self_distill_peak
+        if position < self_distill_stop:
+            progress = (position - self_distill_decay) / max(self_distill_stop - self_distill_decay, 1e-8)
+            return self_distill_peak * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return 0.0
     steps_per_epoch = max(dataloader_steps // grad_accum, 1)
-    total_steps = steps_per_epoch * train_cfg["epochs"]
-    warmup_steps = steps_per_epoch * train_cfg["warmup_epochs"]
+    schedule_steps_per_epoch = steps_per_epoch
+    if resume_scheduler_step is not None and resume_scheduler_step >= 0 and resume_epoch is not None and resume_epoch >= 0:
+        old_steps_per_epoch = round(resume_scheduler_step / max(resume_epoch + 1, 1))
+        if old_steps_per_epoch > 0:
+            schedule_steps_per_epoch = max(schedule_steps_per_epoch, old_steps_per_epoch)
+            if is_main_process() and schedule_steps_per_epoch != steps_per_epoch:
+                print(
+                    f"[scheduler] preserving resume step density: current={steps_per_epoch}, "
+                    f"checkpoint={old_steps_per_epoch}, using={schedule_steps_per_epoch}"
+                )
+    total_steps = schedule_steps_per_epoch * train_cfg["epochs"]
+    warmup_steps = schedule_steps_per_epoch * train_cfg["warmup_epochs"]
+
+    lr_schedule = str(train_cfg.get("lr_schedule", "cosine")).lower()
+    if lr_schedule not in ("cosine", "flat_cosine"):
+        raise ValueError(f"unsupported train.lr_schedule: {lr_schedule!r}")
+    flat_ratio = float(train_cfg.get("flat_ratio", 0.33))
+    if not 0.0 <= flat_ratio < 1.0:
+        raise ValueError("train.flat_ratio must be in [0, 1)")
+    flat_start_step = min(
+        max(int(total_steps * flat_ratio), warmup_steps),
+        max(total_steps - 1, warmup_steps),
+    )
 
     def lr_lambda(step):
         if step < warmup_steps:
-            return (step + 1) / max(warmup_steps, 1)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+            factor = (step + 1) / max(warmup_steps, 1)
+        else:
+            if lr_schedule == "flat_cosine" and step < flat_start_step:
+                progress = 0.0
+            else:
+                decay_start = flat_start_step if lr_schedule == "flat_cosine" else warmup_steps
+                progress = (step - decay_start) / max(total_steps - decay_start, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            factor = 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+        stage2_start = int(train_cfg.get("stage2_start_epoch", train_cfg["epochs"]))
+        stage2_lr_mult = float(train_cfg.get("stage2_lr_mult", 1.0))
+        if step // max(schedule_steps_per_epoch, 1) >= stage2_start:
+            factor *= stage2_lr_mult
+        return factor
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -292,16 +644,28 @@ def main():
 
     start_epoch = 0
     if args.resume and os.path.exists(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = resume_probe if resume_probe is not None else torch.load(args.resume, map_location=device)
         (model.module if world_size > 1 else model).load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
+        if dino_loss_fn is not None:
+            if "dino_adapters" in ckpt:
+                dino_loss_fn.adapters.load_state_dict(ckpt["dino_adapters"])
+            elif is_main_process():
+                print("[resume] warning: checkpoint has no DINO adapter state; adapters remain reinitialized")
+        if distill_loss_fn is not None:
+            if "m2d_adapters" in ckpt:
+                distill_loss_fn.ir_adapters.load_state_dict(ckpt["m2d_adapters"]["ir"])
+                distill_loss_fn.depth_adapters.load_state_dict(ckpt["m2d_adapters"]["depth"])
+            elif is_main_process():
+                print("[resume] warning: checkpoint has no M2D adapter state; adapters remain reinitialized")
         start_epoch = ckpt["epoch"] + 1
         if ema is not None and "ema" in ckpt:
             ema.shadow = {k: v.to(device) for k, v in ckpt["ema"].items()}
             ema.updates = ckpt.get("ema_updates", 0)
         if is_main_process():
             print(f"[resume] from {args.resume}, starting epoch {start_epoch}")
+        resume_probe = None
 
     # checkpoint 轮转用：断点恢复时从 curves.json 取回历史最佳，避免把之前的
     # 最优权重当成旧文件删掉。
@@ -329,17 +693,39 @@ def main():
             train_sampler.set_epoch(epoch)
 
         train_tf.set_epoch(epoch)
+        stage2_start = int(train_cfg.get("stage2_start_epoch", train_cfg["epochs"]))
+        if epoch >= stage2_start:
+            # Explicit 48/16 close-out: fixed training size, no modality dropout,
+            # and no strong geometric scale jitter in the refinement stage.
+            train_tf.modality_dropout_p = float(train_cfg.get("stage2_modality_dropout_p", 0.0))
+            train_tf.scale_range = tuple(train_cfg.get("stage2_scale_range", [1.0, 1.0]))
         if isinstance(train_collate, MultiScaleCollate):
             decay_start = train_tf.stop_decay_epoch_ratio * train_tf.total_epochs
-            train_collate.set_epoch_active(epoch < decay_start)
+            train_collate.set_epoch_active(
+                epoch < decay_start and epoch < stage2_start
+            )
 
         epoch_start = time.time()
         optimizer.zero_grad()
+        max_steps_per_epoch = int(train_cfg.get("max_steps_per_epoch", 0))
         for step, (rgb, ir, depth, targets) in enumerate(train_loader):
+            if max_steps_per_epoch > 0 and step >= max_steps_per_epoch:
+                break
             rgb, ir, depth = rgb.to(device, non_blocking=True), ir.to(device, non_blocking=True), depth.to(
                 device, non_blocking=True
             )
             targets = move_targets_to_device(targets, device)
+            current_self_scale = self_distill_scale(epoch, step)
+            current_dropout_p = student_dropout_p if epoch + step / max(dataloader_steps, 1) < student_dropout_stop else 0.0
+            student_ir, student_depth, student_dropout_rate = apply_student_modality_dropout(
+                ir, depth, current_dropout_p
+            )
+            teacher_outputs = None
+            if current_self_scale > 0.0:
+                with torch.autocast(
+                    device_type="cuda" if use_amp else "cpu", dtype=amp_dtype, enabled=use_amp
+                ):
+                    teacher_outputs = self_distill_loss_fn.teacher_forward(rgb, ir, depth)
 
             # 梯度累积期间跳过 DDP 的梯度 allreduce：只有到累积边界那一步才需要
             # 同步。原先每个 micro-step 都同步，等于把通信量放大了 grad_accum 倍，
@@ -354,7 +740,12 @@ def main():
 
             with sync_ctx:
                 with torch.autocast(device_type="cuda" if use_amp else "cpu", dtype=amp_dtype, enabled=use_amp):
-                    outputs = model(rgb, ir, depth, targets)
+                    if distill_loss_fn is not None or dino_loss_fn is not None:
+                        outputs, rgb_feats, ir_feats, depth_feats = model(
+                            rgb, student_ir, student_depth, targets, return_backbone_feats=True
+                        )
+                    else:
+                        outputs = model(rgb, student_ir, student_depth, targets)
                     loss_dict = criterion(outputs, targets)
                     # criterion 内部已经对每个 key（包括 _aux_i/_dn_i/_enc_i/_pre 等派生 key）
                     # 乘过 weight_dict 系数了（见 dfine_criterion.py forward），所以这里要把
@@ -362,12 +753,75 @@ def main():
                     # —— 之前的写法只加了 4 个基础 key，丢掉了全部辅助解码层损失、去噪损失、
                     # encoder 辅助损失（占总损失量级的大头），等于关掉了 D-FINE 的深监督和
                     # denoising 训练机制。跟官方 det_engine.py 的 `sum(loss_dict.values())` 保持一致。
-                    loss = sum(loss_dict.values()) / grad_accum
+                    total = sum(loss_dict.values())
+                    inner_model = model.module if world_size > 1 else model
+                    if getattr(inner_model, "ir_alignment", None) is not None:
+                        # Diagnostic tensors are detached and deliberately added only
+                        # after the criterion sum, so they never alter optimization.
+                        loss_dict.update(inner_model.ir_alignment.last_metrics())
+                    if distill_loss_fn is not None:
+                        distill_total, distill_metrics = distill_loss_fn(
+                            ir,
+                            depth,
+                            ir_feats,
+                            depth_feats,
+                            targets=targets,
+                        )
+                        distill_scale = 1.0
+                        if epoch >= distill_decay_start and distill_final_scale < 1.0:
+                            decay_steps = max(
+                                (train_cfg["epochs"] - distill_decay_start) * dataloader_steps - 1,
+                                1,
+                            )
+                            decay_step = (epoch - distill_decay_start) * dataloader_steps + step
+                            progress = min(max(decay_step / decay_steps, 0.0), 1.0)
+                            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                            distill_scale = distill_final_scale + (1.0 - distill_final_scale) * cosine
+                        loss_dict["distill_scale"] = distill_total.new_tensor(distill_scale)
+                        loss_dict["loss_distill"] = distill_total * distill_scale
+                        loss_dict.update(
+                            {key: value * distill_scale for key, value in distill_metrics.items()}
+                        )
+                        total = total + loss_dict["loss_distill"]
+                    if dino_loss_fn is not None:
+                        dino_weighted = dino_loss_fn(rgb, rgb_feats, targets=targets)
+                        dino_scale = min(
+                            1.0,
+                            (epoch * dataloader_steps + step + 1) / max(dino_warmup_steps, 1),
+                        ) if dino_warmup_steps > 0 else 1.0
+                        loss_dict["loss_dino_raw"] = (
+                            dino_weighted.detach() / max(dino_loss_fn.weight, 1e-12)
+                        )
+                        loss_dict["dino_weight"] = dino_weighted.new_tensor(
+                            dino_loss_fn.weight * dino_scale
+                        )
+                        loss_dict["loss_dino"] = dino_weighted * dino_scale
+                        total = total + loss_dict["loss_dino"]
+                    if self_distill_loss_fn is not None:
+                        loss_dict["self_distill_scale"] = total.new_tensor(current_self_scale)
+                        loss_dict["student_dropout_rate"] = student_dropout_rate.detach()
+                        if teacher_outputs is not None:
+                            self_total, self_metrics = self_distill_loss_fn(
+                                outputs, teacher_outputs, targets, matcher
+                            )
+                            loss_dict["loss_self_distill"] = self_total * current_self_scale
+                            loss_dict.update(self_metrics)
+                            total = total + loss_dict["loss_self_distill"]
+                        else:
+                            loss_dict["loss_self_distill"] = total.new_zeros(())
+                    loss = total / grad_accum
 
                 loss.backward()
 
             if is_boundary:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip_norm"])
+                # Training-only distillation adapters live outside the student DDP
+                # wrapper, so synchronize their accumulated gradients explicitly.
+                if world_size > 1 and auxiliary_params:
+                    for param in auxiliary_params:
+                        if param.grad is not None:
+                            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                            param.grad.div_(world_size)
+                torch.nn.utils.clip_grad_norm_(clip_params, train_cfg["grad_clip_norm"])
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -375,7 +829,20 @@ def main():
                     ema.update(model)
 
             if is_main_process() and step % train_cfg["log_interval"] == 0:
-                base_keys = ("loss_vfl", "loss_bbox", "loss_giou", "loss_fgl", "loss_ddf")
+                base_keys = (
+                    "loss_vfl", "loss_bbox", "loss_giou", "loss_gcd", "loss_fgl", "loss_ddf",
+                    "loss_distill", "loss_ir", "loss_depth", "loss_cross",
+                    "distill_scale",
+                    "weight_ir_dynamic", "weight_depth_dynamic",
+                    "loss_ir_l0", "loss_ir_l1", "loss_ir_l2",
+                    "loss_depth_l0", "loss_depth_l1", "loss_depth_l2",
+                    "loss_cross_l0", "loss_cross_l1", "loss_cross_l2",
+                    "align_gate_l0", "align_gate_l1", "align_gate_l2",
+                    "align_offset_l0", "align_offset_l1", "align_offset_l2",
+                    "loss_dino_raw", "loss_dino", "dino_weight",
+                    "loss_self_distill", "loss_self_cls", "loss_self_bbox", "loss_self_giou",
+                    "self_pairs", "self_coverage", "self_distill_scale", "student_dropout_rate",
+                )
                 loss_str = " ".join(f"{k}={loss_dict[k].item():.4f}" for k in base_keys if k in loss_dict)
                 lr_now = optimizer.param_groups[-1]["lr"]
                 total_loss = loss.item() * grad_accum
@@ -424,17 +891,19 @@ def main():
             # nn.Module.__call__，不经过 DDP 的 forward 钩子，就不会有任何 collective。
             eval_module = model.module if world_size > 1 else model
             eval_state_backup = ema.apply_to(model) if ema is not None else None
-            eval_result = _run_eval(eval_module, val_loader, device, world_size, cfg)
-            curve_logger.log_eval(
-                epoch,
-                {
-                    "mAP@50-95": eval_result.map_50_95,
-                    "mAP@50": eval_result.map_50,
-                    "mAP@75": eval_result.map_75,
-                },
-            )
-            curve_logger.plot()
-            curve_logger.save_json()
+            eval_result = None
+            if has_val:
+                eval_result = _run_eval(eval_module, val_loader, device, world_size, cfg)
+                curve_logger.log_eval(
+                    epoch,
+                    {
+                        "mAP@50-95": eval_result.map_50_95,
+                        "mAP@50": eval_result.map_50,
+                        "mAP@75": eval_result.map_75,
+                    },
+                )
+                curve_logger.plot()
+                curve_logger.save_json()
 
             ckpt_path = os.path.join(save_dir, f"epoch{epoch}.pt")
             state = (model.module if world_size > 1 else model).state_dict()
@@ -447,6 +916,18 @@ def main():
             if ema is not None:
                 ckpt["ema"] = ema.state_dict()
                 ckpt["ema_updates"] = ema.updates
+            if dino_loss_fn is not None:
+                ckpt["dino_adapters"] = dino_loss_fn.adapters.state_dict()
+            if distill_loss_fn is not None:
+                ckpt["m2d_adapters"] = {
+                    "ir": distill_loss_fn.ir_adapters.state_dict(),
+                    "depth": distill_loss_fn.depth_adapters.state_dict(),
+                }
+            if self_distill_loss_fn is not None:
+                ckpt["self_distill_teacher"] = {
+                    "checkpoint": self_distill_loss_fn.teacher_ckpt,
+                    "source": self_distill_loss_fn.teacher_source,
+                }
             # 先写临时文件再原子改名：写盘失败（如磁盘满）不会留下截断的 .pt，
             # 断点恢复时也不会读到坏文件。
             tmp_path = ckpt_path + ".tmp"
@@ -459,23 +940,44 @@ def main():
                 raise
             print(f"[ckpt] saved {ckpt_path}")
 
-            # checkpoint 轮转：每个 1.5GB，48 epoch 全留会写满磁盘。
-            # 只保留最近 keep_last_n 个 + 历史最佳。
+            # checkpoint 轮转：每个约 1.5GB，完整保留会迅速占满磁盘。
+            # 保留最近 keep_last_n 个，并额外保留验证集 top keep_best_n 个。
             keep_last_n = int(train_cfg.get("keep_last_n", 3))
             if keep_last_n > 0:
-                if eval_result.map_50_95 > best_map:
-                    best_map = eval_result.map_50_95
-                    best_epoch = epoch
                 saved = []
                 for fn in os.listdir(save_dir):
                     m = re.fullmatch(r"epoch(\d+)\.pt", fn)
                     if m:
                         saved.append((int(m.group(1)), fn))
                 saved.sort()
-                for ep, fn in saved[:-keep_last_n]:
-                    if ep != best_epoch:
+                best_epochs = set()
+                if has_val:
+                    try:
+                        import json
+
+                        with open(os.path.join(save_dir, "curves.json"), "r", encoding="utf-8") as f:
+                            rec = json.load(f)
+                        saved_epochs = {ep for ep, _ in saved}
+                        pairs = [
+                            (int(ep), float(v))
+                            for ep, v in zip(
+                                rec.get("eval_epochs", []),
+                                rec.get("eval_metrics", {}).get("mAP@50-95", []),
+                            )
+                            if v is not None and int(ep) in saved_epochs
+                        ]
+                        keep_best_n = int(train_cfg.get("keep_best_n", keep_last_n))
+                        best_epochs = {
+                            ep for ep, _ in sorted(pairs, key=lambda item: item[1], reverse=True)[:keep_best_n]
+                        }
+                    except Exception as exc:
+                        print(f"[ckpt] unable to read validation history for top-k retention: {exc}")
+                protected = {ep for ep, _ in saved[-keep_last_n:]} | best_epochs
+                for ep, fn in saved:
+                    if ep not in protected:
                         os.remove(os.path.join(save_dir, fn))
                         print(f"[ckpt] pruned {fn}")
+
 
             if eval_state_backup is not None:
                 ema.restore(model, eval_state_backup)
