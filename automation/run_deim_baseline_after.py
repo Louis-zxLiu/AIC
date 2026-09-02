@@ -56,6 +56,12 @@ out_dir = Path(cfg["train"]["save_dir"])
 out_dir.mkdir(parents=True, exist_ok=True)
 
 cmd = [TORCHRUN, "--nproc_per_node=4", "aic/tools/train.py", "--config", config_rel]
+latest = sorted(
+    ((int(p.stem[5:]), p) for p in out_dir.glob("epoch*.pt") if p.stem[5:].isdigit()),
+    reverse=True,
+)
+if latest:
+    cmd += ["--resume", str(latest[0][1])]
 log = AUTO / "deim_baseline_train.log"
 with log.open("a", encoding="utf-8") as handle:
     handle.write(f"\n===== START {time.strftime('%F %T')} =====\n")
