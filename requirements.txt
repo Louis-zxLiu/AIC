@@ -7,3 +7,6 @@ calflops
 loguru
 numpy
 Pillow
+tensorboard
+transformers
+matplotlib

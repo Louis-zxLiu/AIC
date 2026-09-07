@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from third_party_dfine import DFINECriterion
-from src.zoo.dfine.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from src.zoo.dfine.box_ops import box_cxcywh_to_xyxy, box_iou, generalized_box_iou
 
 from aic.models.gcd import gcd_loss
 
@@ -70,6 +70,109 @@ class MALCriterion(DFINECriterion):
             # Replace the matched class entry by quality-aware BCE.  The
             # q**gamma factor suppresses noisy low-quality positives while the
             # complementary term still discourages overconfident predictions.
+            row, col = idx
+            q_gamma = q.pow(gamma)
+            losses[row, col, target_labels] = (
+                -q_gamma * log_p[row, col, target_labels]
+                -(1.0 - q_gamma) * log_not_p[row, col, target_labels]
+            )
+
+        loss = losses.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {"loss_vfl": loss}
+
+
+class GCLCriterion(DFINECriterion):
+    """D-FINE VFL with Rank-DETR's GIoU-aware positive target.
+
+    The original D-FINE VFL uses matched IoU as the positive class target.
+    GCL replaces it with ``(GIoU + 1) / 2`` while preserving the negative
+    focal weighting and every auxiliary/denoising loss path in the parent
+    criterion.  The target is detached, as in the original VFL implementation.
+    """
+
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+        assert "pred_boxes" in outputs
+        idx = self._get_src_permutation_idx(indices)
+
+        src_logits = outputs["pred_logits"]
+        target_classes_o = torch.cat(
+            [t["labels"][J] for t, (_, J) in zip(targets, indices)]
+        )
+        target_classes = torch.full(
+            src_logits.shape[:2],
+            self.num_classes,
+            dtype=torch.int64,
+            device=src_logits.device,
+        )
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        if idx[0].numel():
+            src_boxes = outputs["pred_boxes"][idx]
+            target_boxes = torch.cat(
+                [t["boxes"][J] for t, (_, J) in zip(targets, indices)], dim=0
+            )
+            # GIoU is in [-1, 1]; map it to the valid VFL target range [0, 1].
+            giou = torch.diag(
+                generalized_box_iou(
+                    box_cxcywh_to_xyxy(src_boxes),
+                    box_cxcywh_to_xyxy(target_boxes),
+                )
+            ).detach()
+            target_score_o[idx] = (
+                ((giou + 1.0) * 0.5).clamp(0.0, 1.0).to(target_score_o.dtype)
+            )
+
+        target_score = target_score_o.unsqueeze(-1) * target
+        pred_score = F.sigmoid(src_logits).detach()
+        weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits, target_score, weight=weight, reduction="none"
+        )
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {"loss_vfl": loss}
+
+
+class MALGCLCriterion(MALCriterion):
+    """MAL negative weighting with GCL's GIoU-aware positive target.
+
+    This is the explicit compatibility ablation: it keeps MAL's matchability-
+    aware focal treatment for unmatched queries and replaces the matched IoU
+    quality target by ``(GIoU + 1) / 2``.  All other D-FINE, M2D and EMA paths
+    remain unchanged.
+    """
+
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes, values=None):
+        assert "pred_logits" in outputs and "pred_boxes" in outputs
+        src_logits = outputs["pred_logits"]
+        probabilities = src_logits.sigmoid().detach()
+        gamma = float(getattr(self, "mal_gamma", 1.5))
+
+        log_p = F.logsigmoid(src_logits)
+        log_not_p = F.logsigmoid(-src_logits)
+        losses = -(probabilities.pow(gamma) * log_not_p)
+
+        idx = self._get_src_permutation_idx(indices)
+        if idx[0].numel():
+            target_labels = torch.cat(
+                [t["labels"][j] for t, (_, j) in zip(targets, indices)], dim=0
+            )
+            # Compute GIoU from the matched boxes directly.  This intentionally
+            # ignores any optional parent ``values`` metadata: MAL+GCL must use
+            # the transformed GIoU target in every auxiliary/denoising path.
+            src_boxes = outputs["pred_boxes"][idx]
+            target_boxes = torch.cat(
+                [t["boxes"][j] for t, (_, j) in zip(targets, indices)], dim=0
+            )
+            giou = torch.diag(
+                generalized_box_iou(
+                    box_cxcywh_to_xyxy(src_boxes),
+                    box_cxcywh_to_xyxy(target_boxes),
+                )
+            )
+            q = ((giou + 1.0) * 0.5).detach().clamp(0.0, 1.0)
+
             row, col = idx
             q_gamma = q.pow(gamma)
             losses[row, col, target_labels] = (

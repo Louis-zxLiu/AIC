@@ -39,8 +39,13 @@ from aic.data.dataset import (
     scan_samples,
 )
 from aic.data.transforms import SyncMultiModalTransform
-from aic.models.criterion import GCDCriterion, MALCriterion
+from aic.models.criterion import GCDCriterion, GCLCriterion, MALCriterion, MALGCLCriterion
 from aic.models.distill import DINOv2RGBFeatureDistillLoss, M2DDistillLoss, TriStreamSelfDistillLoss
+try:
+    from aic.models.distill import FDRCrossModelDistillLoss
+except ImportError:
+    # Older deployed workspaces may not include the optional FDR ablation.
+    FDRCrossModelDistillLoss = None
 from aic.models.matcher import GCDHungarianMatcher, SNL1HungarianMatcher
 from aic.models.backbone import TriStreamHGNetv2
 from aic.models.tristream_dfine import build_single_modality_dfine, build_tristream_dfine
@@ -199,6 +204,71 @@ def apply_student_modality_dropout(
     return student_ir, student_depth, drop.float().mean()
 
 
+class RepeatFactorDistributedSampler(torch.utils.data.Sampler[int]):
+    """Distributed repeat-factor sampler for image-level long-tail balancing."""
+
+    def __init__(
+        self,
+        weights: list[float],
+        *,
+        num_replicas: int,
+        rank: int,
+        seed: int,
+        shuffle: bool = True,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+        if not weights:
+            raise ValueError("weights must be non-empty")
+        self.weights = [max(1.0, float(w)) for w in weights]
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        self.base_indices = self._build_base_indices()
+        self.num_samples = int(math.ceil(len(self.base_indices) / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def _build_base_indices(self) -> list[int]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed)
+        indices: list[int] = []
+        for idx, weight in enumerate(self.weights):
+            whole = int(math.floor(weight))
+            indices.extend([idx] * whole)
+            frac = weight - whole
+            if frac > 0 and torch.rand((), generator=generator).item() < frac:
+                indices.append(idx)
+        return indices or list(range(len(self.weights)))
+
+    def __iter__(self):
+        indices = list(self.base_indices)
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            order = torch.randperm(len(indices), generator=generator).tolist()
+            indices = [indices[i] for i in order]
+        if len(indices) < self.total_size:
+            repeats = math.ceil((self.total_size - len(indices)) / len(indices))
+            indices += (indices * repeats)[: self.total_size - len(indices)]
+        else:
+            indices = indices[: self.total_size]
+        return iter(indices[self.rank : self.total_size : self.num_replicas])
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    @property
+    def repeat_size(self) -> int:
+        return len(self.base_indices)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -278,25 +348,52 @@ def main():
         "depth_confidence_cache": dataset_distill_cfg.get("depth_confidence_cache"),
     }
     train_ds = MultiModalDetDataset(
-        train_samples, train_tf, has_labels=True, disp8_mode=disp8_mode, **confidence_args
+        train_samples,
+        train_tf,
+        has_labels=True,
+        disp8_mode=disp8_mode,
+        mosaic_prob=float(train_cfg.get("mosaic_prob", 0.0)),
+        mosaic_start_epoch=int(train_cfg.get("mosaic_start_epoch", 4)),
+        mosaic_stop_epoch=(
+            int(train_cfg["mosaic_stop_epoch"])
+            if train_cfg.get("mosaic_stop_epoch") is not None
+            else None
+        ),
+        **confidence_args,
     )
     val_ds = MultiModalDetDataset(val_samples, val_tf, has_labels=True, disp8_mode=disp8_mode)
 
     # 类别不均衡重采样（算法设计.md §3.4，计划.md §2.4 tier 1）：ClassBalancedDataset
-    # 风格的按类别频率过采样。DistributedSampler 不支持自定义样本权重，DDP 模式下暂时
-    # 退化为均匀 shuffle（仍需先跑通单卡验证过采样收益后再移植到分布式，见文档说明）。
+    # 风格的按类别频率过采样。DDP 下使用同步的 repeat-factor 索引表，再按 rank 切片。
     class_balance_cfg = train_cfg.get("class_balance", {})
     use_class_balance = class_balance_cfg.get("enabled", False)
 
-    if world_size > 1:
-        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
-    elif use_class_balance:
+    if use_class_balance:
+        oversample_thr = class_balance_cfg.get("oversample_thr", 0.2)
         weights = compute_class_balanced_weights(
-            train_samples, oversample_thr=class_balance_cfg.get("oversample_thr", 0.2)
+            train_samples,
+            oversample_thr=oversample_thr,
+            mode=class_balance_cfg.get("mode", "image"),
         )
-        train_sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        if world_size > 1:
+            train_sampler = RepeatFactorDistributedSampler(
+                weights,
+                num_replicas=world_size,
+                rank=rank,
+                seed=seed,
+                shuffle=True,
+            )
+        else:
+            train_sampler = torch.utils.data.WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
         if is_main_process():
-            print(f"[data] class-balanced sampling enabled, oversample_thr={class_balance_cfg.get('oversample_thr', 0.2)}")
+            detail = (
+                f"repeat_size={train_sampler.repeat_size} per_rank={len(train_sampler)}"
+                if world_size > 1
+                else f"samples={len(weights)}"
+            )
+            print(f"[data] class-balanced sampling enabled, oversample_thr={oversample_thr} {detail}")
+    elif world_size > 1:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
     else:
         train_sampler = None
 
@@ -413,6 +510,21 @@ def main():
                 f"final_scale={distill_cfg.get('final_scale', 1.0)}"
             )
 
+    fdr_cfg = cfg.get("fdr_distill") if not args.mono_modality else None
+    fdr_loss_fn = None
+    if fdr_cfg:
+        fdr_loss_fn = FDRCrossModelDistillLoss(
+            cfg=cfg,
+            ir_teacher_ckpt=fdr_cfg["ir_teacher_ckpt"],
+            depth_teacher_ckpt=fdr_cfg["depth_teacher_ckpt"],
+            weight=fdr_cfg.get("weight", 0.25),
+            temperature=fdr_cfg.get("temperature", 5.0),
+            ir_weight=fdr_cfg.get("ir_weight", 1.0),
+            depth_weight=fdr_cfg.get("depth_weight", 1.0),
+        ).to(device)
+        if is_main_process():
+            print(f"[distill] FDR cross-model enabled: weight={fdr_loss_fn.weight}, T={fdr_loss_fn.temperature}")
+
     dino_cfg = cfg.get("dino_distill") if not args.mono_modality else None
     dino_loss_fn = None
     if dino_cfg:
@@ -472,6 +584,10 @@ def main():
     criterion_type = str(cfg.get("criterion_type", "dfine")).lower()
     if criterion_type == "mal":
         criterion_cls = MALCriterion
+    elif criterion_type in ("mal_gcl", "mal+gcl"):
+        criterion_cls = MALGCLCriterion
+    elif criterion_type == "gcl":
+        criterion_cls = GCLCriterion
     elif criterion_type == "gcd" or (criterion_type == "dfine" and cost_type == "gcd"):
         criterion_cls = GCDCriterion
     elif criterion_type == "dfine":
@@ -689,10 +805,11 @@ def main():
 
     for epoch in range(start_epoch, train_cfg["epochs"]):
         model.train()
-        if isinstance(train_sampler, DistributedSampler):
+        if hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         train_tf.set_epoch(epoch)
+        train_ds.set_epoch(epoch)
         stage2_start = int(train_cfg.get("stage2_start_epoch", train_cfg["epochs"]))
         if epoch >= stage2_start:
             # Explicit 48/16 close-out: fixed training size, no modality dropout,
@@ -740,7 +857,7 @@ def main():
 
             with sync_ctx:
                 with torch.autocast(device_type="cuda" if use_amp else "cpu", dtype=amp_dtype, enabled=use_amp):
-                    if distill_loss_fn is not None or dino_loss_fn is not None:
+                    if distill_loss_fn is not None or dino_loss_fn is not None or fdr_loss_fn is not None:
                         outputs, rgb_feats, ir_feats, depth_feats = model(
                             rgb, student_ir, student_depth, targets, return_backbone_feats=True
                         )
@@ -783,6 +900,13 @@ def main():
                             {key: value * distill_scale for key, value in distill_metrics.items()}
                         )
                         total = total + loss_dict["loss_distill"]
+                    if fdr_loss_fn is not None:
+                        fdr_total, fdr_metrics = fdr_loss_fn(
+                            rgb, ir, depth, outputs, targets, matcher
+                        )
+                        loss_dict["loss_fdr"] = fdr_total
+                        loss_dict.update(fdr_metrics)
+                        total = total + fdr_total
                     if dino_loss_fn is not None:
                         dino_weighted = dino_loss_fn(rgb, rgb_feats, targets=targets)
                         dino_scale = min(
@@ -837,6 +961,7 @@ def main():
                     "loss_ir_l0", "loss_ir_l1", "loss_ir_l2",
                     "loss_depth_l0", "loss_depth_l1", "loss_depth_l2",
                     "loss_cross_l0", "loss_cross_l1", "loss_cross_l2",
+                    "loss_fdr", "loss_fdr_ir", "loss_fdr_depth", "fdr_pairs",
                     "align_gate_l0", "align_gate_l1", "align_gate_l2",
                     "align_offset_l0", "align_offset_l1", "align_offset_l2",
                     "loss_dino_raw", "loss_dino", "dino_weight",

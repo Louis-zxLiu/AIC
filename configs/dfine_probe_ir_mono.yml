@@ -1,0 +1,94 @@
+# M²D-LIF linear probing 诊断（计划.md §2.8）：IR 单模态基线。
+# backbone 从预训练权重正常初始化，随 encoder/decoder 一起从零训练（--mono_modality ir，
+# 不传 --frozen_backbone_ckpt）。与 run3_hires 用同一 fold=0 划分，epochs 降到 20 控制成本。
+
+num_classes: 12
+image_size: [736, 1280]
+
+pretrained_detector: /home/u703/AIC_Project_sy/AIC/weights/dfine_l_coco.pth
+
+backbone:
+  name: B4
+  use_lab: false
+  return_idx: [1, 2, 3]
+  pretrained: true
+
+opf:
+  num_heads: 8
+  sr_ratios: [4, 2, 1]
+
+encoder:
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  enc_act: gelu
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  expansion: 1.0
+  act: silu
+
+decoder:
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  num_points: [3, 6, 3]
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  activation: relu
+
+matcher:
+  weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+  use_focal_loss: true
+  alpha: 0.25
+  gamma: 2.0
+
+criterion:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: [vfl, boxes, local]
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+
+train:
+  data_root: "/home/u703/AIC_Project_sy/dataset/训练集"
+  n_folds: 5
+  fold: 0
+  batch_size: 3
+  grad_accum_steps: 3
+  epochs: 20
+  warmup_epochs: 2
+  lr: 1.4e-4
+  backbone_lr_mult: 0.05
+  weight_decay: 1.0e-4
+  grad_clip_norm: 0.1
+  amp_dtype: bfloat16
+  modality_dropout_p: 0.0
+  num_workers: 8
+  save_dir: /home/u703/AIC_Project_sy/AIC/outputs/probe_ir_mono
+  log_interval: 20
+  eval_interval_epochs: 2
+  keep_last_n: 3
+  ema:
+    enabled: true
+    decay: 0.998
+    warmups: 200
+  class_balance:
+    enabled: true
+    oversample_thr: 0.2
+  multi_scale:
+    enabled: true
+    sizes: [[576, 1024], [640, 1120], [672, 1184], [736, 1280], [800, 1408]]
+
+inference:
+  score_thresh: 0.05
+  max_boxes: 100

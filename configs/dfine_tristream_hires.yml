@@ -14,7 +14,7 @@ image_size: [736, 1280]
 # 完全随机初始化的，DETR 系解码器在 1600 张图的数据量上从零训练不可能收敛。
 # 12 类分类头因 shape 与 COCO 的 80 类不符而自动跳过，保持随机初始化。
 # 置为 null 可关闭（例如比赛规则不允许 COCO 检测预训练时）。
-pretrained_detector: /root/autodl-tmp/weights/dfine_l_coco.pth
+pretrained_detector: /home/u703/AIC_Project_sy/AIC/weights/dfine_l_coco.pth
 
 backbone:
   name: B4          # 显存不足时按 §3.3 降级到 B2；充裕时可试 B5
@@ -75,7 +75,7 @@ criterion:
   reg_max: 32
 
 train:
-  data_root: "/root/autodl-tmp/dataset/训练集"
+  data_root: "/home/u703/AIC_Project_sy/dataset/训练集"
   n_folds: 5
   fold: 0
   batch_size: 3          # 单卡有效 batch，DDP 下总 batch = batch_size * world_size * grad_accum_steps
@@ -96,7 +96,7 @@ train:
   amp_dtype: bfloat16
   modality_dropout_p: 0.1
   num_workers: 8
-  save_dir: /root/autodl-tmp/outputs/run3_hires
+  save_dir: /home/u703/AIC_Project_sy/AIC/outputs/run3_hires
   log_interval: 20
   eval_interval_epochs: 2
   keep_last_n: 3           # 每个 ckpt 1.5GB，50G 盘装不下 24 个；只留最近 3 个 + 历史最佳

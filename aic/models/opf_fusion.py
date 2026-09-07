@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from aic.models.dwt import HaarDWT2D, HaarIDWT2D
+
 
 class OrthogonalDecorrelation(nn.Module):
     """将 feat_b 中与 feat_a 冗余的成分投影去除，通道级可学习强度。"""
@@ -67,9 +69,15 @@ class ConfidenceGate(nn.Module):
     的深度是无效的"。ir 分支没有对应先验，传 None 时退化为纯特征驱动。
     """
 
-    def __init__(self, channels: int, use_mask_prior: bool = False):
+    def __init__(
+        self,
+        channels: int,
+        use_mask_prior: bool = False,
+        hard_mask_prior: bool = False,
+    ):
         super().__init__()
         self.use_mask_prior = use_mask_prior
+        self.hard_mask_prior = hard_mask_prior
         in_ch = channels + (1 if use_mask_prior else 0)
         self.gate = nn.Sequential(
             nn.Conv2d(in_ch, channels // 4, kernel_size=1),
@@ -80,9 +88,13 @@ class ConfidenceGate(nn.Module):
 
     def forward(self, feat: torch.Tensor, mask_prior: torch.Tensor | None = None) -> torch.Tensor:
         x = feat
-        if self.use_mask_prior and mask_prior is not None:
+        if self.use_mask_prior and self.hard_mask_prior and mask_prior is not None:
             x = torch.cat([feat, mask_prior], dim=1)
         g = self.gate(x)  # B,1,H,W
+        if self.use_mask_prior and mask_prior is not None:
+            # The learned gate may refine confidence where depth exists, but
+            # it must not resurrect a region whose measured quality is zero.
+            g = g * mask_prior.clamp(0.0, 1.0)
         return feat * g
 
 
@@ -152,21 +164,45 @@ class OPFFusionBlock(nn.Module):
     depth_mask 参数）：无效深度区域的先验直接参与门控，而不是仅靠网络从
     depth 特征统计里隐式反推。ir 没有对应的显式有效性信号，门控保持纯
     特征驱动。
+
+    use_dwt=True 时（计划.md §2.3 P1.5），三路输入先各自做一次 Haar DWT，
+    拆成 1 个低频子带（LL）+ 3 个高频子带（LH/HL/HH）：
+      - 低频 LL 承载全局几何/结构信息，走上述完整的 decorr+gate+attention
+        流程（depth 本质低频主导，这条路径的正交解耦语义仍然成立）。
+      - 高频 LH/HL/HH 承载边缘/纹理细节，参照 WaveMamba 的做法逐像素取三个
+        模态里绝对值更大的那个，不学习融合权重——物理意义是"更强边缘信号
+        更可信"，避免可学习融合在训练不足时把边缘细节和噪声一起抑制。
+    最后 IDWT 把融合后的低频 + 选择后的高频合回单一分辨率特征。
     """
 
-    def __init__(self, channels: int, num_heads: int = 8, sr_ratio: int = 1):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 8,
+        sr_ratio: int = 1,
+        use_dwt: bool = False,
+        hard_depth_gate: bool = False,
+    ):
         super().__init__()
         self.decorr_depth = OrthogonalDecorrelation(channels)
         self.decorr_ir = OrthogonalDecorrelation(channels)
-        self.gate_depth = ConfidenceGate(channels, use_mask_prior=True)
+        self.gate_depth = ConfidenceGate(
+            channels,
+            use_mask_prior=True,
+            hard_mask_prior=hard_depth_gate,
+        )
         self.gate_ir = ConfidenceGate(channels, use_mask_prior=False)
         self.fuse_depth = CrossModalAttentionFusion(channels, num_heads, sr_ratio)
         self.fuse_ir = CrossModalAttentionFusion(channels, num_heads, sr_ratio)
 
-    def forward(
-        self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor, depth_mask: torch.Tensor | None = None
+        self.use_dwt = use_dwt
+        if use_dwt:
+            self.dwt = HaarDWT2D(channels)
+            self.idwt = HaarIDWT2D(channels)
+
+    def _fuse_low_freq(
+        self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor, depth_mask: torch.Tensor | None
     ) -> torch.Tensor:
-        # 串行：先去相关+融合 depth，再用"更新后的 rgb"去相关+融合 ir。
         depth_decorr = self.decorr_depth(rgb, depth)
         depth_gated = self.gate_depth(depth_decorr, mask_prior=depth_mask)
         fused = self.fuse_depth(rgb, depth_gated)
@@ -176,6 +212,35 @@ class OPFFusionBlock(nn.Module):
         fused = self.fuse_ir(fused, ir_gated)
 
         return fused
+
+    @staticmethod
+    def _select_high_freq(rgb_hf: torch.Tensor, ir_hf: torch.Tensor, depth_hf: torch.Tensor) -> torch.Tensor:
+        # 逐像素取三者中绝对值最大的（WaveMamba 式高频融合），保留符号。
+        stacked = torch.stack([rgb_hf, ir_hf, depth_hf], dim=0)  # 3,B,C,H,W
+        idx = stacked.abs().argmax(dim=0, keepdim=True)
+        return stacked.gather(0, idx).squeeze(0)
+
+    def forward(
+        self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor, depth_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if not self.use_dwt:
+            return self._fuse_low_freq(rgb, ir, depth, depth_mask)
+
+        h, w = rgb.shape[-2:]
+        rgb_ll, rgb_lh, rgb_hl, rgb_hh = self.dwt(rgb)
+        ir_ll, ir_lh, ir_hl, ir_hh = self.dwt(ir)
+        depth_ll, depth_lh, depth_hl, depth_hh = self.dwt(depth)
+
+        depth_mask_ll = None
+        if depth_mask is not None:
+            depth_mask_ll = F.interpolate(depth_mask, size=rgb_ll.shape[-2:], mode="nearest")
+
+        fused_ll = self._fuse_low_freq(rgb_ll, ir_ll, depth_ll, depth_mask_ll)
+        fused_lh = self._select_high_freq(rgb_lh, ir_lh, depth_lh)
+        fused_hl = self._select_high_freq(rgb_hl, ir_hl, depth_hl)
+        fused_hh = self._select_high_freq(rgb_hh, ir_hh, depth_hh)
+
+        return self.idwt(fused_ll, fused_lh, fused_hl, fused_hh, out_hw=(h, w))
 
 
 class MultiScaleOPF(nn.Module):
@@ -195,6 +260,8 @@ class MultiScaleOPF(nn.Module):
         channels_per_scale: list[int],
         num_heads: int = 8,
         sr_ratios: tuple[int, ...] | list[int] | None = None,
+        use_dwt: bool = False,
+        hard_depth_gate: bool = False,
     ):
         super().__init__()
         if sr_ratios is None:
@@ -205,8 +272,18 @@ class MultiScaleOPF(nn.Module):
             raise ValueError(
                 f"sr_ratios 长度 {len(sr_ratios)} 与尺度数 {len(channels_per_scale)} 不一致"
             )
+        self.hard_depth_gate = bool(hard_depth_gate)
         self.blocks = nn.ModuleList(
-            [OPFFusionBlock(c, num_heads, sr) for c, sr in zip(channels_per_scale, sr_ratios)]
+            [
+                OPFFusionBlock(
+                    c,
+                    num_heads,
+                    sr,
+                    use_dwt=use_dwt,
+                    hard_depth_gate=hard_depth_gate,
+                )
+                for c, sr in zip(channels_per_scale, sr_ratios)
+            ]
         )
 
     def forward(
@@ -216,13 +293,15 @@ class MultiScaleOPF(nn.Module):
         depth_feats: list[torch.Tensor],
         depth_valid_mask: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        # depth_valid_mask: B,1,H,W（原始分辨率），下采样到每个尺度对应
-        # 分辨率后作为该尺度 ConfidenceGate 的显式先验。用 nearest 保持
-        # 有效性掩码本身的硬边界语义，不引入 bilinear 插值产生的过渡值。
+        # depth_valid_mask is now a continuous quality map. Area resampling
+        # preserves valid coverage instead of dropping sparse pixels through
+        # nearest-neighbor sampling at stride 8/16/32.
         masks_per_scale = [None] * len(self.blocks)
         if depth_valid_mask is not None:
+            resize_mode = "area" if self.hard_depth_gate else "nearest"
             masks_per_scale = [
-                F.interpolate(depth_valid_mask, size=feat.shape[-2:], mode="nearest") for feat in rgb_feats
+                F.interpolate(depth_valid_mask, size=feat.shape[-2:], mode=resize_mode)
+                for feat in rgb_feats
             ]
         return [
             block(r, i, d, depth_mask=m)

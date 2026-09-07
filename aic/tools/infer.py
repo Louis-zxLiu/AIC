@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import zipfile
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -29,6 +30,77 @@ from aic.data.transforms import SyncMultiModalTransform
 from aic.eval.submission_validator import validate_submission_dir
 from aic.models.tristream_dfine import build_tristream_dfine
 from third_party_dfine import DFINEPostProcessor
+
+
+def box_iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    x1 = max(float(a[0]), float(b[0]))
+    y1 = max(float(a[1]), float(b[1]))
+    x2 = min(float(a[2]), float(b[2]))
+    y2 = min(float(a[3]), float(b[3]))
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area_a = max(0.0, float(a[2] - a[0])) * max(0.0, float(a[3] - a[1]))
+    area_b = max(0.0, float(b[2] - b[0])) * max(0.0, float(b[3] - b[1]))
+    return inter / max(area_a + area_b - inter, 1e-9)
+
+
+def fuse_hflip_predictions(base, flipped, iou_threshold: float, keep_unmatched_flipped: bool = False):
+    """Two-view WBF that never merges two detections from the same view."""
+    by_class = defaultdict(lambda: [[], []])
+    for view_idx, result in enumerate((base, flipped)):
+        boxes, scores, labels = result
+        for box, score, label in zip(boxes, scores, labels):
+            by_class[int(label)][view_idx].append((box, float(score)))
+
+    fused = []
+    for label, (base_dets, flip_dets) in by_class.items():
+        clusters = [
+            {"box": box.copy(), "weight": score, "score": score, "has_flip": False}
+            for box, score in sorted(base_dets, key=lambda item: item[1], reverse=True)
+        ]
+        for box, score in sorted(flip_dets, key=lambda item: item[1], reverse=True):
+            best_idx, best_iou = -1, iou_threshold
+            for idx, cluster in enumerate(clusters):
+                if cluster["has_flip"]:
+                    continue
+                overlap = box_iou_xyxy(box, cluster["box"])
+                if overlap >= best_iou:
+                    best_idx, best_iou = idx, overlap
+            if best_idx < 0:
+                if keep_unmatched_flipped:
+                    clusters.append({"box": box.copy(), "weight": score, "score": score, "has_flip": True})
+                continue
+            cluster = clusters[best_idx]
+            total_weight = cluster["weight"] + score
+            cluster["box"] = (cluster["box"] * cluster["weight"] + box * score) / total_weight
+            cluster["weight"] = total_weight
+            cluster["score"] = max(cluster["score"], score)
+            cluster["has_flip"] = True
+
+        fused.extend((cluster["box"], cluster["score"], label) for cluster in clusters)
+
+    fused.sort(key=lambda item: item[1], reverse=True)
+    if not fused:
+        return (
+            np.empty((0, 4), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
+            np.empty((0,), dtype=np.int64),
+        )
+    boxes, scores, labels = zip(*fused)
+    return np.stack(boxes), np.asarray(scores), np.asarray(labels)
+
+
+def score_only_hflip_predictions(base, flipped, iou_threshold: float, alpha: float):
+    """Keep original boxes and gently boost only flip-consistent scores."""
+    boxes, scores, labels = (v.copy() for v in base)
+    flip_boxes, flip_scores, flip_labels = flipped
+    for i, (box, label) in enumerate(zip(boxes, labels)):
+        best = 0.0
+        for fbox, fscore, flabel in zip(flip_boxes, flip_scores, flip_labels):
+            if int(label) == int(flabel) and box_iou_xyxy(box, fbox) >= iou_threshold:
+                best = max(best, float(fscore))
+        if best > 0.0:
+            scores[i] = min(1.0, scores[i] + alpha * best)
+    return boxes, scores, labels
 
 
 def main():
@@ -45,6 +117,13 @@ def main():
     # run2 及更早的权重是在 disp8 深度全零的输入上训出来的，推理必须传 zero 复刻该行为
     # （实测传 use 会让 disp8 子域从 0.5693 掉到 0.5448）。重训后的权重用 use。
     parser.add_argument("--disp8_mode", default=None, choices=["use", "zero"])
+    parser.add_argument("--tta_hflip", action="store_true", help="average original and synchronized horizontal-flip views")
+    parser.add_argument("--tta_iou", type=float, default=0.60, help="IoU threshold for two-view WBF")
+    parser.add_argument("--tta_keep_unmatched", action="store_true", help="keep flip-only detections; disabled is safer")
+    parser.add_argument("--tta_score_only_hflip", action="store_true", help="boost scores for flip-consistent original boxes")
+    parser.add_argument("--tta_alpha", type=float, default=0.05, help="score boost coefficient for score-only flip TTA")
+    parser.add_argument("--score_thresh", type=float, default=None, help="override inference score threshold")
+    parser.add_argument("--max_boxes", type=int, default=None, help="override per-image output box limit")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -68,8 +147,8 @@ def main():
     )
 
     inf_cfg = cfg["inference"]
-    score_thresh = inf_cfg["score_thresh"]
-    max_boxes = inf_cfg["max_boxes"]
+    score_thresh = args.score_thresh if args.score_thresh is not None else inf_cfg["score_thresh"]
+    max_boxes = args.max_boxes if args.max_boxes is not None else inf_cfg["max_boxes"]
 
     samples = scan_samples(args.test_root, require_labels=False)
     if not samples:
@@ -107,9 +186,14 @@ def main():
     with torch.no_grad():
         for rgb, ir, depth, targets in loader:
             rgb, ir, depth = rgb.to(device), ir.to(device), depth.to(device)
-            outputs = model(rgb, ir, depth)
             orig_sizes = torch.stack([t["orig_size"] for t in targets]).to(device)
-            results = postproc(outputs, orig_sizes)
+            results = postproc(model(rgb, ir, depth), orig_sizes)
+            flipped_results = None
+            if args.tta_hflip or args.tta_score_only_hflip:
+                flipped_results = postproc(
+                    model(torch.flip(rgb, [-1]), torch.flip(ir, [-1]), torch.flip(depth, [-1])),
+                    orig_sizes,
+                )
 
             for i, t in enumerate(targets):
                 stem = t["stem"]
@@ -120,6 +204,33 @@ def main():
 
                 keep = scores >= score_thresh
                 boxes_px, scores, labels = boxes_px[keep], scores[keep], labels[keep]
+
+                if flipped_results is not None:
+                    flip_boxes = flipped_results[i]["boxes"].cpu().numpy()
+                    flip_scores = flipped_results[i]["scores"].cpu().numpy()
+                    flip_labels = flipped_results[i]["labels"].cpu().numpy()
+                    flip_keep = flip_scores >= score_thresh
+                    flip_boxes = flip_boxes[flip_keep]
+                    flip_scores = flip_scores[flip_keep]
+                    flip_labels = flip_labels[flip_keep]
+                    if len(flip_boxes):
+                        old_x1 = flip_boxes[:, 0].copy()
+                        flip_boxes[:, 0] = w - flip_boxes[:, 2]
+                        flip_boxes[:, 2] = w - old_x1
+                    if args.tta_score_only_hflip:
+                        boxes_px, scores, labels = score_only_hflip_predictions(
+                            (boxes_px, scores, labels),
+                            (flip_boxes, flip_scores, flip_labels),
+                            args.tta_iou,
+                            args.tta_alpha,
+                        )
+                    else:
+                        boxes_px, scores, labels = fuse_hflip_predictions(
+                            (boxes_px, scores, labels),
+                            (flip_boxes, flip_scores, flip_labels),
+                            args.tta_iou,
+                            args.tta_keep_unmatched,
+                        )
 
                 order = np.argsort(-scores)[:max_boxes]
                 boxes_px, scores, labels = boxes_px[order], scores[order], labels[order]

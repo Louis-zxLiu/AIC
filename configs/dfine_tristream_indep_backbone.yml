@@ -1,0 +1,106 @@
+# P2 消融：在 dfine_tristream_hires.yml（run3_hires 基线）基础上把三模态
+# backbone 的 stages 从共享改成三份独立（各自完整 HGNetv2，参数量 x3）。
+# 验证 计划.md §2.4「共享中高层先验」这一设计假设本身是否成立——动机与
+# 实现见 算法设计.md §2.1、aic/models/backbone.py 的 share_stages 开关。
+# 除 backbone.share_stages 和 save_dir 外，其余配置与 dfine_tristream_hires.yml
+# 完全一致，保证同 fold 对比只有这一个变量。
+#
+# 注意：参数量 x3 会显著增加显存占用，batch_size/grad_accum 可能需要按实测
+# 显存爬梯下调；如需下调必须同步按有效 batch 不变的原则调整 grad_accum_steps，
+# 并按线性缩放规则重新核算 lr（当前 1.4e-4 对应有效 batch 18）。
+
+num_classes: 12
+image_size: [736, 1280]
+
+pretrained_detector: /home/u703/AIC_Project_sy/AIC/weights/dfine_l_coco.pth
+
+backbone:
+  name: B4
+  use_lab: false
+  return_idx: [1, 2, 3]
+  pretrained: true
+  share_stages: false   # 改动：唯一与 hires 基线不同的地方
+
+opf:
+  num_heads: 8
+  sr_ratios: [4, 2, 1]
+
+encoder:
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  enc_act: gelu
+  use_encoder_idx: [2]
+  num_encoder_layers: 1
+  expansion: 1.0
+  act: silu
+
+decoder:
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 4
+  num_points: [3, 6, 3]
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  activation: relu
+
+matcher:
+  weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+  use_focal_loss: true
+  alpha: 0.25
+  gamma: 2.0
+
+criterion:
+  weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5}
+  losses: [vfl, boxes, local]
+  alpha: 0.75
+  gamma: 2.0
+  reg_max: 32
+
+train:
+  data_root: "/home/u703/AIC_Project_sy/dataset/训练集"
+  n_folds: 5
+  fold: 0
+  batch_size: 3          # 独立 backbone 参数量 x3，直接跑 batch_size=3 会 OOM；已在
+                          # backbone.py 里给独立 stages 前向接入 activation checkpointing
+                          # （只增加反向重算开销，不影响任何数值结果，已本地验证 loss/梯度
+                          # 逐位对齐），换回显存后 batch_size 与 grad_accum 都能与基线一致，
+                          # 消除之前 batch_size=1 造成的 BN 统计量失衡这一混杂变量
+  grad_accum_steps: 3
+  epochs: 48
+  warmup_epochs: 2
+  lr: 1.4e-4
+  backbone_lr_mult: 0.05
+  weight_decay: 1.0e-4
+  grad_clip_norm: 0.1
+  amp_dtype: bfloat16
+  modality_dropout_p: 0.1
+  num_workers: 8
+  save_dir: /home/u703/AIC_Project_sy/AIC/outputs/run8_indep_backbone
+  log_interval: 20
+  eval_interval_epochs: 2
+  keep_last_n: 3
+  ema:
+    enabled: true
+    decay: 0.998
+    warmups: 200
+  class_balance:
+    enabled: true
+    oversample_thr: 0.2
+  multi_scale:
+    enabled: true
+    sizes: [[576, 1024], [640, 1120], [672, 1184], [736, 1280], [800, 1408]]
+
+inference:
+  score_thresh: 0.05
+  max_boxes: 100

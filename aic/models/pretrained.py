@@ -30,6 +30,11 @@ def _remap_backbone_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]
     for k, v in sd.items():
         if k.startswith("backbone.stem."):
             out[k.replace("backbone.stem.", "backbone.stem_rgb.", 1)] = v
+        elif k.startswith("backbone.stages."):
+            # Official D-FINE/DEIM checkpoints use one `stages` branch.  The
+            # tri-stream wrapper names the RGB branch `stages_rgb`; map it so
+            # the shared RGB/IR/Depth stages can inherit the detector weights.
+            out[k.replace("backbone.stages.", "backbone.stages_rgb.", 1)] = v
         else:
             out[k] = v
     return out

@@ -26,10 +26,19 @@ depth 的两种格式（训练集 2000 张 / 测试集 1000 张全量扫描）�
 from __future__ import annotations
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 DEPTH_MIN_MM = 300      # 相机最近感知距离 0.3m
 DEPTH_MAX_MM = 20000    # 相机最远感知距离 20m（含）取开区间上界之前的整数上限
+JPEG_CHANNEL_TOLERANCE = 8
+
+# Depth tensor layout shared by the dataset, backbone, fusion, and distillation code.
+DEPTH_VALUE_CHANNEL = 0
+DEPTH_VALID_CHANNEL = 1
+DEPTH_MM16_CHANNEL = 2
+DEPTH_DISP8_CHANNEL = 3
+DEPTH_QUALITY_CHANNEL = 4
+DEPTH_INPUT_CHANNELS = 5
 
 
 def load_visible(path: str) -> np.ndarray:
@@ -53,37 +62,65 @@ DEPTH_KIND_DISP8 = "disp8"  # B 类：8bit 视差/逆深度，值大=近
 DEPTH_KIND_BAD = "bad"      # 真正无法解析
 
 
-def load_depth_raw(path: str) -> tuple[np.ndarray, str]:
+def load_depth_raw(path: str) -> tuple[np.ndarray, str, np.ndarray]:
     """读取深度图原始值，并识别它属于哪种格式。
 
     Returns:
         depth_raw: HxW int64。语义由 kind 决定，本函数不做任何数值变换。
         kind: DEPTH_KIND_MM16 / DEPTH_KIND_DISP8 / DEPTH_KIND_BAD
+        sensor_quality: HxW float32 in [0,1]. For JPEG depth this records
+            channel agreement after lossy compression.
     """
     img = Image.open(path)
     # Pillow 对单通道整型 PNG 按存储字节序细分 mode（"I"=32bit 有符号，
     # "I;16"/"I;16B"/"I;16L"/"I;16N" 等=16bit），真实数据集中的正常深度图
     # 实测是 "I;16"，不是 "I"——只匹配 "I" 会把全部正常样本误判为退化格式。
     if img.mode.startswith("I"):
-        return np.array(img, dtype=np.int64), DEPTH_KIND_MM16
+        raw = np.array(img, dtype=np.int64)
+        return raw, DEPTH_KIND_MM16, np.ones(raw.shape, dtype=np.float32)
 
     arr = np.array(img)
     if arr.ndim == 3:
-        # 三通道冗余的 8bit 灰度视差图。要求三通道一致才认，避免把真彩色图误判成深度。
-        if arr.shape[2] >= 3 and np.array_equal(arr[..., 0], arr[..., 1]) and np.array_equal(
-            arr[..., 1], arr[..., 2]
-        ):
-            return arr[..., 0].astype(np.int64), DEPTH_KIND_DISP8
+        # The 8-bit depth subset is saved as lossy JPEG. Its latent signal is
+        # grayscale, but compression introduces small per-channel differences.
+        # Decode the channel median when the image is still near-grayscale.
+        if arr.shape[2] >= 3 and arr.dtype == np.uint8:
+            rgb = arr[..., :3].astype(np.int16)
+            spread = rgb.max(axis=2) - rgb.min(axis=2)
+            if int(spread.max(initial=0)) <= JPEG_CHANNEL_TOLERANCE:
+                raw = np.median(rgb, axis=2).astype(np.int64)
+                agreement = 1.0 - 0.5 * spread.astype(np.float32) / JPEG_CHANNEL_TOLERANCE
+                return raw, DEPTH_KIND_DISP8, agreement.clip(0.5, 1.0)
         h, w = arr.shape[:2]
-        return np.zeros((h, w), dtype=np.int64), DEPTH_KIND_BAD
+        return (
+            np.zeros((h, w), dtype=np.int64),
+            DEPTH_KIND_BAD,
+            np.zeros((h, w), dtype=np.float32),
+        )
     if arr.ndim == 2 and arr.dtype == np.uint8:
-        return arr.astype(np.int64), DEPTH_KIND_DISP8
+        raw = arr.astype(np.int64)
+        return raw, DEPTH_KIND_DISP8, np.ones(raw.shape, dtype=np.float32)
 
     h, w = arr.shape[:2]
-    return np.zeros((h, w), dtype=np.int64), DEPTH_KIND_BAD
+    return (
+        np.zeros((h, w), dtype=np.int64),
+        DEPTH_KIND_BAD,
+        np.zeros((h, w), dtype=np.float32),
+    )
 
 
-def preprocess_depth(depth_raw: np.ndarray, kind: str) -> tuple[np.ndarray, np.ndarray]:
+def _local_coverage(mask: np.ndarray, radius: int = 8) -> np.ndarray:
+    """Return a fast box-filtered valid-depth coverage map."""
+    encoded = (mask.astype(np.float32, copy=False).clip(0.0, 1.0) * 255.0).astype(np.uint8)
+    blurred = Image.fromarray(encoded, mode="L").filter(ImageFilter.BoxBlur(radius))
+    return (np.asarray(blurred, dtype=np.float32) / 255.0).clip(0.0, 1.0)
+
+
+def preprocess_depth(
+    depth_raw: np.ndarray,
+    kind: str,
+    sensor_quality: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """深度图预处理：掩码 + 截断 + 逆深度归一化。
 
     直接 d/65535 是错的：真实量程只占理论值域([0,65535])的 30%，
@@ -96,13 +133,13 @@ def preprocess_depth(depth_raw: np.ndarray, kind: str) -> tuple[np.ndarray, np.n
         depth_norm: HxW float32 in [0,1]，无效区域填 0。
         valid_mask: HxW float32 {0,1}，作为额外通道随 depth_norm 一起送入网络，
                     使模型可学习区分"近距离"和"无有效深度"两种语义。
+        quality_mask: HxW float32 [0,1], combining local valid coverage and
+            JPEG channel agreement. It is continuous rather than a hard flag.
     """
     if kind == DEPTH_KIND_BAD:
         h, w = depth_raw.shape
-        return (
-            np.zeros((h, w), dtype=np.float32),
-            np.zeros((h, w), dtype=np.float32),
-        )
+        zeros = np.zeros((h, w), dtype=np.float32)
+        return zeros.copy(), zeros.copy(), zeros.copy()
 
     if kind == DEPTH_KIND_DISP8:
         # 已是逆深度空间（值大=近），与下面 mm16 分支输出的 depth_norm 方向一致，
@@ -110,7 +147,10 @@ def preprocess_depth(depth_raw: np.ndarray, kind: str) -> tuple[np.ndarray, np.n
         valid_mask = depth_raw > 0
         depth_norm = (depth_raw.astype(np.float32) / 255.0).clip(0.0, 1.0)
         depth_norm = np.where(valid_mask, depth_norm, 0.0).astype(np.float32)
-        return depth_norm, valid_mask.astype(np.float32)
+        valid_mask = valid_mask.astype(np.float32)
+        raw_quality = np.ones_like(valid_mask) if sensor_quality is None else sensor_quality.astype(np.float32)
+        quality_mask = valid_mask * raw_quality.clip(0.0, 1.0) * np.sqrt(_local_coverage(valid_mask))
+        return depth_norm, valid_mask, quality_mask.astype(np.float32)
 
     valid_mask = (depth_raw >= DEPTH_MIN_MM) & (depth_raw <= DEPTH_MAX_MM)
     clipped = np.clip(depth_raw, DEPTH_MIN_MM, DEPTH_MAX_MM).astype(np.float32)
@@ -122,7 +162,10 @@ def preprocess_depth(depth_raw: np.ndarray, kind: str) -> tuple[np.ndarray, np.n
     depth_norm = np.clip(depth_norm, 0.0, 1.0).astype(np.float32)
     depth_norm = np.where(valid_mask, depth_norm, 0.0).astype(np.float32)
 
-    return depth_norm, valid_mask.astype(np.float32)
+    valid_mask = valid_mask.astype(np.float32)
+    raw_quality = np.ones_like(valid_mask) if sensor_quality is None else sensor_quality.astype(np.float32)
+    quality_mask = valid_mask * raw_quality.clip(0.0, 1.0) * np.sqrt(_local_coverage(valid_mask))
+    return depth_norm, valid_mask, quality_mask.astype(np.float32)
 
 
 def load_labels_yolo(path: str) -> np.ndarray:
