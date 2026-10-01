@@ -97,11 +97,13 @@ class M2DDistillLoss(nn.Module):
         reliability_floor: float = 0.25,
         reliability_power: float = 1.0,
         method: str = "pkd_lcm",
+        global_sample_normalization: bool = False,
     ):
         super().__init__()
         if method not in ("cosine", "pkd_lcm"):
             raise ValueError(f"unsupported M2D distillation method: {method!r}")
         self.method = method
+        self.global_sample_normalization = bool(global_sample_normalization)
         self.weight = float(weight)
         self.ir_weight = float(ir_weight)
         self.depth_weight = float(depth_weight)
@@ -345,10 +347,20 @@ class M2DDistillLoss(nn.Module):
                 weight = active.to(per_sample.dtype)
             else:
                 weight = sample_weight.reshape(-1) * active.to(per_sample.dtype)
-            losses.append((per_sample * weight).sum() / weight.sum().clamp_min(1e-6))
+            losses.append(self._sample_mean(per_sample, weight))
         level_weight = losses[0].new_tensor(self.level_weights)
         aggregate = (torch.stack(losses) * level_weight).sum() / level_weight.sum()
         return aggregate, losses
+
+    def _sample_mean(self, per_sample, weight):
+        denominator = weight.sum().detach()
+        world = 1
+        if self.global_sample_normalization and torch.distributed.is_initialized():
+            world = torch.distributed.get_world_size()
+            torch.distributed.all_reduce(denominator)
+        # DDP and the external adapter synchronizer average gradients by world.
+        # This scale yields the global active-sample mean, including empty ranks.
+        return (per_sample * weight).sum() * world / denominator.clamp_min(1e-6)
 
     def _cosine_loss(
         self,

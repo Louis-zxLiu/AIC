@@ -191,6 +191,7 @@ class MultiModalDetDataset(Dataset):
         mosaic_prob: float = 0.0,
         mosaic_start_epoch: int = 4,
         mosaic_stop_epoch: int | None = None,
+        context_views: dict | None = None,
     ):
         if disp8_mode not in ("use", "zero"):
             raise ValueError(f"disp8_mode 必须是 'use' 或 'zero'，收到 {disp8_mode!r}")
@@ -203,6 +204,12 @@ class MultiModalDetDataset(Dataset):
         self.mosaic_start_epoch = int(mosaic_start_epoch)
         self.mosaic_stop_epoch = mosaic_stop_epoch
         self.current_epoch = 0
+        self.context_policy = None
+        if context_views is not None:
+            from .context_views import ContextViewPolicy
+            if not transform.train or not has_labels or mosaic_prob:
+                raise ValueError("context views require labelled training without mosaic")
+            self.context_policy = ContextViewPolicy(samples, context_views, transform.size_hw, transform.min_box_px)
         self.teacher_confidence = {}
         for modality, cache_path in (
             ("ir", ir_confidence_cache),
@@ -334,16 +341,20 @@ class MultiModalDetDataset(Dataset):
             item = self._load_item(index)
         s, visible, infrared, depth_norm, valid_mask, quality_mask, depth_kind, boxes, labels = item
 
-        vis, ir, depth_stack, target = self.transform(
-            visible,
-            infrared,
-            depth_norm,
-            valid_mask,
-            quality_mask,
-            depth_kind,
-            boxes,
-            labels,
-        )
+        inputs = (visible, infrared, depth_norm, valid_mask, quality_mask, depth_kind, boxes, labels)
+        if self.context_policy is None:
+            vis, ir, depth_stack, target = self.transform(*inputs)
+        else:
+            from .context_views import isolated_random, view_seed
+            if any(x.shape[:2] != visible.shape[:2] for x in inputs[1:5]):
+                raise ValueError(f"{s.stem}: context-view native modality grids differ")
+            window, meta = self.context_policy.choose(s.stem, self.current_epoch, boxes, labels, visible.shape[:2])
+            base = self.context_policy.seed
+            with isolated_random(view_seed(base, self.current_epoch, s.stem, "augmentation")):
+                vis, ir, depth_stack, target = self.transform(
+                    *inputs, crop_window=window,
+                    appearance_seed=view_seed(base, self.current_epoch, s.stem, "appearance"))
+            target["context_view"] = meta
         target["stem"] = s.stem
         confidence = self.teacher_confidence.get(s.stem)
         if confidence is None and s.stem.startswith("mosaic_"):

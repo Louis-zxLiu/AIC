@@ -80,6 +80,27 @@ class MALCriterion(DFINECriterion):
         loss = losses.mean(1).sum() * src_logits.shape[1] / num_boxes
         return {"loss_vfl": loss}
 
+    def forward(self, outputs, targets, **kwargs):
+        losses = super().forward(outputs, targets, **kwargs)
+        oto_outputs = outputs.get("enc_oto_outputs")
+        if not oto_outputs:
+            return losses
+
+        # Co-DETR-style one-to-many supervision is training-only.  The matcher
+        # returns four disjoint Hungarian rounds, so every GT can contribute
+        # several positive encoder proposals without changing inference.
+        topk = int(getattr(self, "encoder_oto_topk", 4))
+        matches = self.matcher(oto_outputs[0], targets, return_topk=topk)["indices_o2m"]
+        num_pos = max(sum(len(pair[0]) for pair in matches), 1)
+        oto = oto_outputs[0]
+        label_loss = self.loss_labels_vfl(oto, targets, matches, num_pos)["loss_vfl"]
+        box_losses = self.loss_boxes(oto, targets, matches, num_pos)
+        weight = float(getattr(self, "encoder_oto_weight", 0.5))
+        losses["loss_oto_vfl"] = label_loss * self.weight_dict.get("loss_oto_vfl", 1.0) * weight
+        losses["loss_oto_bbox"] = box_losses["loss_bbox"] * self.weight_dict.get("loss_oto_bbox", 1.0) * weight
+        losses["loss_oto_giou"] = box_losses["loss_giou"] * self.weight_dict.get("loss_oto_giou", 1.0) * weight
+        return losses
+
 
 class GCLCriterion(DFINECriterion):
     """D-FINE VFL with Rank-DETR's GIoU-aware positive target.

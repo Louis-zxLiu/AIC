@@ -1,0 +1,141 @@
+num_classes: 12
+image_size:
+- 720
+- 1280
+backbone:
+  name: B5
+  use_lab: false
+  return_idx:
+  - 1
+  - 2
+  - 3
+  pretrained: true
+  depth_in_chs: 5
+opf:
+  num_heads: 8
+  sr_ratios:
+  - 4
+  - 2
+  - 1
+  hard_depth_gate: true
+encoder:
+  feat_strides:
+  - 8
+  - 16
+  - 32
+  hidden_dim: 384
+  nhead: 8
+  dim_feedforward: 2048
+  dropout: 0.0
+  enc_act: gelu
+  use_encoder_idx:
+  - 2
+  num_encoder_layers: 1
+  expansion: 1.0
+  act: silu
+decoder:
+  hidden_dim: 256
+  num_levels: 3
+  num_layers: 6
+  eval_idx: -1
+  num_queries: 300
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+  reg_max: 32
+  reg_scale: 8
+  num_points:
+  - 3
+  - 6
+  - 3
+  nhead: 8
+  dim_feedforward: 1024
+  dropout: 0.0
+  activation: relu
+matcher:
+  weight_dict:
+    cost_class: 2
+    cost_bbox: 5
+    cost_giou: 2
+  use_focal_loss: true
+  alpha: 0.25
+  gamma: 2.0
+criterion_type: rf_native
+criterion: {}
+train:
+  data_root: data/train
+  seed: 42
+  n_folds: 5
+  fold: 0
+  full_data: true
+  batch_size: 1
+  grad_accum_steps: 6
+  epochs: 49
+  warmup_epochs: 2
+  lr: 0.0001
+  backbone_lr_mult: 0.05
+  weight_decay: 0.0001
+  grad_clip_norm: 0.1
+  amp_dtype: bfloat16
+  modality_dropout_p: 0.0
+  num_workers: 2
+  save_dir: outputs/teacher_depth
+  log_interval: 10
+  eval_interval_epochs: 1
+  keep_last_n: 2
+  keep_best_n: 0
+  ema:
+    enabled: true
+    decay: 0.998
+    warmups: 200
+  class_balance:
+    enabled: true
+    oversample_thr: 0.2
+    mode: image
+    max_repeat_factor: 4.0
+  lr_schedule: flat_cosine
+  flat_ratio: 0.33
+  stop_decay_epoch_ratio: 0.8
+  final_scale_range:
+  - 0.9
+  - 1.1
+  no_aug_epoch: 56
+  multi_scale:
+    enabled: false
+  disp8_mode: use
+  eval_max_boxes: 100
+  submission_eval: true
+  retain_epochs:
+  - 48
+inference:
+  score_thresh: 0.25
+  max_boxes: 100
+rf_pretrained: weights/rf-detr-xxlarge.pth
+nas:
+  windows:
+  - 2
+  - 4
+  decoder_layers:
+  - 3
+  - 4
+  - 5
+  queries:
+  - 150
+  - 225
+  - 300
+  resolutions:
+  - - 720
+    - 1280
+  - - 800
+    - 1440
+  - - 880
+    - 1600
+  steps_per_epoch: 1012
+  eval_arch: &id001
+    windows_rgb: 4
+    windows_ir: 4
+    windows_depth: 4
+    decoder_layers: 5
+    queries: 300
+    opf_depth: 1
+  force_arch: *id001

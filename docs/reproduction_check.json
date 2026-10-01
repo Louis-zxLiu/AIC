@@ -1,0 +1,9 @@
+{
+  "files_original": 1000,
+  "files_reproduced": 1000,
+  "different_files": 0,
+  "examples": [],
+  "threshold": 0.25,
+  "checkpoint": "student_epoch63_ema.pt",
+  "online_score_user_reported": 58.903
+}

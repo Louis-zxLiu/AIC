@@ -77,6 +77,161 @@ class ResidualModalityFusion(nn.Module):
         return fused
 
 
+class P3IRLocalInteraction(nn.Module):
+    """Stride-8 IR local-window residual for small-object detail recovery.
+
+    The final projection is zero initialized, so enabling this module preserves
+    the baseline function at initialization while allowing local RGB/IR
+    interactions to be learned at the highest detector feature resolution.
+    """
+
+    def __init__(self, channels: int, hidden_channels: int | None = None):
+        super().__init__()
+        hidden = int(hidden_channels or max(channels // 2, 32))
+        self.block = nn.Sequential(
+            nn.Conv2d(channels * 2, hidden, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(32 if hidden % 32 == 0 else 1, hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.block[-1].weight)
+        nn.init.zeros_(self.block[-1].bias)
+
+    def forward(self, rgb: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
+        return rgb + self.block(torch.cat([rgb, ir], dim=1))
+
+
+class ModalStageAdapter(nn.Module):
+    """Low-rank residual adapters for the non-RGB high-level streams."""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        hidden = max(channels // reduction, 32)
+        self.down = nn.Conv2d(channels, hidden, 1)
+        self.depthwise = nn.Conv2d(hidden, hidden, 3, padding=1, groups=hidden)
+        self.act = nn.GELU()
+        self.up = nn.Conv2d(hidden, channels, 1)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.up(self.act(self.depthwise(self.down(x))))
+
+
+class P3IRDeformableInteraction(nn.Module):
+    """Small zero-init local IR sampler at stride 8.
+
+    It predicts bounded offsets from RGB/IR P3 and samples a compact 3x3
+    neighborhood from IR. The zero-initialized output projection preserves the
+    native detector at initialization.
+    """
+
+    def __init__(self, channels: int, points: int = 9, max_offset: float = 2.0):
+        super().__init__()
+        self.points = int(points)
+        self.max_offset = float(max_offset)
+        hidden = max(channels // 4, 32)
+        self.offset = nn.Sequential(
+            nn.Conv2d(channels * 2, hidden, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, self.points * 2, 1),
+        )
+        self.value = nn.Conv2d(channels, channels, 1)
+        self.out = nn.Conv2d(channels * 2, channels, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, rgb: torch.Tensor, ir: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = rgb.shape
+        offsets = torch.tanh(self.offset(torch.cat([rgb, ir], dim=1)))
+        yy, xx = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, h, device=rgb.device, dtype=rgb.dtype),
+            torch.linspace(-1.0, 1.0, w, device=rgb.device, dtype=rgb.dtype),
+            indexing="ij",
+        )
+        base = torch.stack([xx, yy], dim=-1).view(1, h, w, 1, 2)
+        grid_offsets = offsets.permute(0, 2, 3, 1).view(b, h, w, self.points, 2)
+        scale = rgb.new_tensor([2.0 / max(w - 1, 1), 2.0 / max(h - 1, 1)])
+        grid = (base + grid_offsets * self.max_offset * scale).clamp(-1.0, 1.0)
+        sampled = []
+        value = self.value(ir)
+        for point in range(self.points):
+            sampled.append(torch.nn.functional.grid_sample(
+                value, grid[..., point, :], mode="bilinear", padding_mode="border", align_corners=True
+            ))
+        local = torch.stack(sampled, dim=0).mean(dim=0)
+        return rgb + self.out(torch.cat([rgb, local], dim=1))
+
+
+class P3DepthGeometryInteraction(nn.Module):
+    """Use Depth P3 validity/geometry to gate a local IR residual."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(channels // 4, 32)
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels + 1, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.offset = nn.Conv2d(channels + 1, 2, 3, padding=1)
+        self.out = nn.Conv2d(channels * 2, channels, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor, quality: torch.Tensor | None) -> torch.Tensor:
+        q = torch.ones_like(depth[:, :1]) if quality is None else quality
+        q = torch.nn.functional.interpolate(q, size=depth.shape[-2:], mode="bilinear", align_corners=False)
+        q = torch.nn.functional.interpolate(q, size=rgb.shape[-2:], mode="bilinear", align_corners=False)
+        depth = torch.nn.functional.interpolate(depth, size=rgb.shape[-2:], mode="bilinear", align_corners=False)
+        gate = self.gate(torch.cat([depth, q], dim=1)) * q.clamp(0.0, 1.0)
+        delta = torch.tanh(self.offset(torch.cat([depth, q], dim=1)))
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, rgb.shape[-2], device=rgb.device, dtype=rgb.dtype),
+            torch.linspace(-1.0, 1.0, rgb.shape[-1], device=rgb.device, dtype=rgb.dtype),
+            indexing="ij",
+        )
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(rgb.shape[0], -1, -1, -1).clone()
+        scale = rgb.new_tensor([2.0 / max(rgb.shape[-1] - 1, 1), 2.0 / max(rgb.shape[-2] - 1, 1)])
+        grid = (grid + delta.permute(0, 2, 3, 1) * scale).clamp(-1.0, 1.0)
+        local = torch.nn.functional.grid_sample(ir, grid, mode="bilinear", padding_mode="border", align_corners=True)
+        return rgb + self.out(torch.cat([rgb, gate * local], dim=1))
+
+
+class SharedPrivateEvidence(nn.Module):
+    """Factor modal features into an OPF-shared path and private residuals.
+
+    The private branch starts at zero, so the experiment is function-preserving
+    at initialization.  Only the IR private P3 residual is exposed to B1;
+    Depth private features never become a direct classification value path.
+    """
+
+    def __init__(self, channels_per_scale, reduction: int = 16):
+        super().__init__()
+        self.private = nn.ModuleDict()
+        for modality in ("rgb", "ir", "depth"):
+            self.private[modality] = nn.ModuleList()
+            for channels in channels_per_scale:
+                hidden = max(int(channels) // int(reduction), 32)
+                block = nn.Sequential(
+                    nn.Conv2d(channels, hidden, 1),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, channels, 1),
+                )
+                nn.init.zeros_(block[-1].weight)
+                nn.init.zeros_(block[-1].bias)
+                self.private[modality].append(block)
+
+    def forward(self, rgb_feats, ir_feats, depth_feats):
+        private = {}
+        shared = {}
+        for name, feats in (("rgb", rgb_feats), ("ir", ir_feats), ("depth", depth_feats)):
+            private[name] = [block(feat) for block, feat in zip(self.private[name], feats)]
+            shared[name] = [feat - delta for feat, delta in zip(feats, private[name])]
+        return shared["rgb"], shared["ir"], shared["depth"], private["ir"]
+
+
 class SingleModalityDFINE(nn.Module):
     """单模态 D-FINE，用于计划.md §2.8 M²D-LIF linear probing 诊断。
 
@@ -154,6 +309,10 @@ def build_single_modality_dfine(cfg: dict, modality: str, frozen_backbone: TriSt
     dec_cfg["feat_channels"] = encoder.out_channels
     dec_cfg["feat_strides"] = encoder.out_strides
     dec_cfg["num_classes"] = cfg["num_classes"]
+    if cfg.get("query_modal_router", {}).get("enabled", False):
+        dec_cfg["query_modal_router"] = True
+        dec_cfg["modal_feat_channels"] = [backbone.out_channels[0]] * 3
+        dec_cfg["query_modal_router_ir_only"] = cfg.get("query_modal_router", {}).get("ir_only", True)
     decoder = DFINETransformer(**dec_cfg)
 
     model = SingleModalityDFINE(backbone, modality, encoder, decoder)
@@ -165,7 +324,11 @@ def build_single_modality_dfine(cfg: dict, modality: str, frozen_backbone: TriSt
     if cfg.get("load_pretrained_detector", False) and ckpt:
         from .pretrained import load_dfine_detector_weights
 
-        load_dfine_detector_weights(model, ckpt)
+        load_dfine_detector_weights(
+            model,
+            ckpt,
+            class_mapping=cfg.get("pretrained_class_mapping"),
+        )
 
     return model
 
@@ -179,6 +342,11 @@ class TriStreamDFINE(nn.Module):
         decoder: nn.Module,
         ir_alignment: MultiScaleIRAlignment | None = None,
         residual_fusion: ResidualModalityFusion | None = None,
+        p3_ir_local: P3IRLocalInteraction | None = None,
+        modal_adapters: nn.ModuleDict | None = None,
+        p3_ir_deform: P3IRDeformableInteraction | None = None,
+        p3_depth_geometry: P3DepthGeometryInteraction | None = None,
+        shared_private: SharedPrivateEvidence | None = None,
     ):
         super().__init__()
         self.backbone = backbone
@@ -187,6 +355,11 @@ class TriStreamDFINE(nn.Module):
         self.decoder = decoder
         self.ir_alignment = ir_alignment
         self.residual_fusion = residual_fusion
+        self.p3_ir_local = p3_ir_local
+        self.modal_adapters = modal_adapters
+        self.p3_ir_deform = p3_ir_deform
+        self.p3_depth_geometry = p3_depth_geometry
+        self.shared_private = shared_private
 
     def forward(self, rgb: torch.Tensor, ir: torch.Tensor, depth: torch.Tensor, targets=None, return_backbone_feats: bool = False):
         rgb_feats, ir_feats, depth_feats = self.backbone(rgb, ir, depth)
@@ -202,12 +375,38 @@ class TriStreamDFINE(nn.Module):
             if self.ir_alignment is not None
             else ir_feats
         )
+        if self.modal_adapters is not None:
+            ir_fusion_feats = [self.modal_adapters["ir"][i](feat) for i, feat in enumerate(ir_fusion_feats)]
+            depth_feats = [self.modal_adapters["depth"][i](feat) for i, feat in enumerate(depth_feats)]
+        ir_private_feats = None
+        if self.shared_private is not None:
+            rgb_feats, ir_fusion_feats, depth_feats, ir_private_feats = self.shared_private(
+                rgb_feats, ir_fusion_feats, depth_feats
+            )
         if self.residual_fusion is not None:
             fused = self.residual_fusion(rgb_feats, ir_fusion_feats, depth_feats, depth_quality_mask)
         else:
             fused = self.opf(rgb_feats, ir_fusion_feats, depth_feats, depth_valid_mask=depth_quality_mask)
+        if self.p3_ir_local is not None:
+            fused[0] = self.p3_ir_local(fused[0], ir_fusion_feats[0])
+        if self.p3_ir_deform is not None:
+            detail_ir = ir_fusion_feats[0]
+            if ir_private_feats is not None:
+                detail_ir = detail_ir + ir_private_feats[0]
+            fused[0] = self.p3_ir_deform(fused[0], detail_ir)
+        if self.p3_depth_geometry is not None:
+            fused[0] = self.p3_depth_geometry(
+                fused[0], ir_fusion_feats[0], depth_feats[0], depth_quality_mask
+            )
         enc_out = self.encoder(fused)
-        out = self.decoder(enc_out, targets)
+        out = self.decoder(
+            enc_out,
+            targets,
+            # Query-level fusion needs the full pyramid.  Keep the quality map
+            # as the fourth item so depth evidence remains validity-gated.
+            modal_feats=(rgb_feats, ir_fusion_feats, depth_feats, depth_quality_mask),
+            raw_modalities=(rgb, ir, depth[:, : self.backbone.depth_in_chs]),
+        )
         # return_backbone_feats：M2D 蒸馏（计划.md §2.8 后续）需要 OPF 融合*之前*
         # 的 IR/Depth 多尺度特征去对齐各自单模态 teacher 的 backbone 输出——融合
         # 后的 fused/enc_out 已经是三模态混合的单路表示，无法把 loss 单独归因到
@@ -225,6 +424,14 @@ class TriStreamDFINE(nn.Module):
 
 
 def build_tristream_dfine(cfg: dict) -> TriStreamDFINE:
+    if cfg.get('backbone', {}).get('rgb'):
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(int(cfg.get('initialization_seed', 42)))
+            return _build_tristream_dfine(cfg)
+    return _build_tristream_dfine(cfg)
+
+
+def _build_tristream_dfine(cfg: dict) -> TriStreamDFINE:
     """从字典配置（见 configs/dfine_tristream.yml 的 python 端加载结果）构建模型。"""
     from third_party_dfine import DFINETransformer, HybridEncoder
 
@@ -270,6 +477,46 @@ def build_tristream_dfine(cfg: dict) -> TriStreamDFINE:
     dec_cfg["feat_channels"] = encoder.out_channels
     dec_cfg["feat_strides"] = encoder.out_strides
     dec_cfg["num_classes"] = cfg["num_classes"]
+    tri_query_cfg = dict(cfg.get("tri_modal_query_decoder", {}))
+    if tri_query_cfg.get("enabled", False):
+        dec_cfg["tri_modal_query_decoder"] = True
+        dec_cfg["tri_modal_query_heads"] = int(tri_query_cfg.get("heads", 8))
+    if cfg.get("query_modal_router", {}).get("enabled", False):
+        dec_cfg["query_modal_router"] = True
+        dec_cfg["modal_feat_channels"] = [backbone.out_channels[0]] * 3
+        dec_cfg["query_modal_router_ir_only"] = cfg.get("query_modal_router", {}).get("ir_only", True)
+    region_cfg = dict(cfg.get("query_region_fusion", {}))
+    if region_cfg.get("enabled", False):
+        dec_cfg["query_region_fusion"] = True
+        dec_cfg["query_region_points"] = int(region_cfg.get("points", 9))
+        dec_cfg["query_region_max_offset"] = float(region_cfg.get("max_offset", 0.25))
+        dec_cfg["query_region_hidden_dim"] = int(region_cfg.get("hidden_dim", 128))
+    region_refine_cfg = dict(cfg.get("query_region_refine", {}))
+    if region_refine_cfg.get("enabled", False):
+        dec_cfg["query_region_refine"] = True
+        dec_cfg["query_region_points"] = int(region_refine_cfg.get("points", 9))
+        dec_cfg["query_region_hidden_dim"] = int(region_refine_cfg.get("hidden_dim", 128))
+    raw_zoom_cfg = dict(cfg.get("raw_zoom_refine", {}))
+    if raw_zoom_cfg.get("enabled", False):
+        dec_cfg.update(
+            {
+                "raw_zoom_refine": True,
+                "raw_zoom_modal_channels": [3, 1, int(bb_cfg.get("depth_in_chs", 2))],
+                "raw_zoom_crop_size": int(raw_zoom_cfg.get("crop_size", 16)),
+                "raw_zoom_context_scale": float(raw_zoom_cfg.get("context_scale", 2.0)),
+                "raw_zoom_min_crop_pixels": float(raw_zoom_cfg.get("min_crop_pixels", 32.0)),
+                "raw_zoom_patch_dim": int(raw_zoom_cfg.get("patch_dim", 96)),
+                "raw_zoom_depth_quality_channel": int(raw_zoom_cfg.get("depth_quality_channel", 4)),
+            }
+        )
+    dec_cfg["encoder_oto_supervision"] = bool(
+        cfg.get("encoder_oto_supervision", {}).get("enabled", False)
+    )
+    dec_cfg["modal_feat_channels"] = (
+        list(backbone.out_channels)
+        if tri_query_cfg.get("enabled", False)
+        else [backbone.out_channels[0]] * 3
+    )
     decoder = DFINETransformer(**dec_cfg)
 
     # Construct the optional module after the detector body. With a fixed seed,
@@ -286,16 +533,75 @@ def build_tristream_dfine(cfg: dict) -> TriStreamDFINE:
         )
 
     model = TriStreamDFINE(
-        backbone, opf, encoder, decoder, ir_alignment=ir_alignment, residual_fusion=residual_fusion
+        backbone,
+        opf,
+        encoder,
+        decoder,
+        ir_alignment=ir_alignment,
+        residual_fusion=residual_fusion,
+        p3_ir_local=(
+            P3IRLocalInteraction(
+                backbone.out_channels[0],
+                hidden_channels=int(cfg.get("p3_ir_local", {}).get("hidden_channels", 192)),
+            )
+            if cfg.get("p3_ir_local", {}).get("enabled", False)
+            else None
+        ),
+        modal_adapters=(
+            nn.ModuleDict({
+                "ir": nn.ModuleList([
+                    ModalStageAdapter(c, reduction=int(cfg.get("modal_adapter", {}).get("reduction", 16)))
+                    for c in backbone.out_channels
+                ]),
+                "depth": nn.ModuleList([
+                    ModalStageAdapter(c, reduction=int(cfg.get("modal_adapter", {}).get("reduction", 16)))
+                    for c in backbone.out_channels
+                ]),
+            })
+            if cfg.get("modal_adapter", {}).get("enabled", False)
+            else None
+        ),
+        p3_ir_deform=(
+            P3IRDeformableInteraction(
+                backbone.out_channels[0],
+                points=int(cfg.get("p3_ir_deform", {}).get("points", 9)),
+                max_offset=float(cfg.get("p3_ir_deform", {}).get("max_offset", 2.0)),
+            )
+            if cfg.get("p3_ir_deform", {}).get("enabled", False)
+            else None
+        ),
+        p3_depth_geometry=(
+            P3DepthGeometryInteraction(backbone.out_channels[0])
+            if cfg.get("p3_depth_geometry", {}).get("enabled", False)
+            else None
+        ),
+        shared_private=(
+            SharedPrivateEvidence(
+                backbone.out_channels,
+                reduction=int(cfg.get("shared_private_evidence", {}).get("reduction", 16)),
+            )
+            if cfg.get("shared_private_evidence", {}).get("enabled", False)
+            else None
+        ),
     )
 
-    # backbone.pretrained 只给了 HGNetv2 的分类权重，encoder/decoder 仍是随机
-    # 初始化。若配置了检测预训练权重，在这里覆盖进去（12 类头因 shape 不符会
-    # 自动跳过，保持随机初始化）。详见 aic/models/pretrained.py。
+    # backbone.pretrained 只给了 HGNetv2 的分类权重，检测预训练在这里覆盖。
+    # 分类头默认仍按 shape 严格匹配；本实验通过配置显式打开 COCO->AIC
+    # 语义行迁移，未映射的类别继续保留随机初始化。
     ckpt = cfg.get("pretrained_detector")
     if ckpt:
         from .pretrained import load_dfine_detector_weights
 
-        load_dfine_detector_weights(model, ckpt)
+        model.pretrained_report = load_dfine_detector_weights(
+            model,
+            ckpt,
+            class_mapping=cfg.get("pretrained_class_mapping"),
+            strict_body=bool(bb_cfg.get('rgb')),
+        )
 
+    if bb_cfg.get('rgb'):
+        from .dinov3_rgb import attach_rgb_backbone
+        if not ckpt:
+            model.pretrained_report = {}
+        model = attach_rgb_backbone(model, cfg)
     return model

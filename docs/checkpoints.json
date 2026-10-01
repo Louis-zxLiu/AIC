@@ -1,0 +1,31 @@
+{
+  "run": "full_student_w050_ir_off_depth_x2",
+  "online_score": 58.903,
+  "epoch": 63,
+  "score_threshold": 0.25,
+  "original_checkpoint_bytes": 5112114213,
+  "original_checkpoint_sha256": "8bcf5292b3b66fd10daca32aa713c16bf0ff2f67baba884c99c4e8257d32fc57",
+  "assets": [
+    {
+      "name": "student_epoch63_full.pt",
+      "bytes": 5112114213,
+      "sha256": "8bcf5292b3b66fd10daca32aa713c16bf0ff2f67baba884c99c4e8257d32fc57"
+    },
+    {
+      "name": "student_epoch63_ema.pt",
+      "bytes": 1286513957,
+      "sha256": "257d088183eee9499c497c938dfc4857cb442174419d9d801c8579dfe3d3c215"
+    },
+    {
+      "name": "teacher_ir_epoch37.pt",
+      "bytes": 505529012,
+      "sha256": "b28759ef06ab52d08facf5198f12604e8470715984b9b7c2815325ce4b388cb4"
+    },
+    {
+      "name": "teacher_depth_epoch48.pt",
+      "bytes": 505532249,
+      "sha256": "2f4f27f03898bd9a9f68356aefbcfbda8b4592edf19ec0887444e8d795f4fa3a"
+    }
+  ],
+  "storage": "Local only; checkpoint binaries are not published to GitHub."
+}

@@ -45,6 +45,15 @@ class CurveLogger:
         for k, v in loss_dict.items():
             self.train_losses.setdefault(k, []).append(v)
 
+    def truncate_after(self, epoch: int, steps_per_epoch: int) -> None:
+        keep = sum(ep <= epoch for ep in self.eval_epochs)
+        self.eval_epochs = self.eval_epochs[:keep]
+        self.eval_metrics = {k:v[:keep] for k,v in self.eval_metrics.items()}
+        keep = sum(step < (epoch+1)*steps_per_epoch for step in self.train_steps)
+        self.train_steps = self.train_steps[:keep]
+        self.train_lrs = self.train_lrs[:keep]
+        self.train_losses = {k:v[:keep] for k,v in self.train_losses.items()}
+
     def log_eval(self, epoch: int, metrics: dict[str, float]) -> None:
         self.eval_epochs.append(epoch)
         for k, v in metrics.items():
@@ -58,8 +67,11 @@ class CurveLogger:
             "eval_epochs": self.eval_epochs,
             "eval_metrics": self.eval_metrics,
         }
-        with open(os.path.join(self.save_dir, "curves.json"), "w", encoding="utf-8") as f:
+        path = os.path.join(self.save_dir, "curves.json")
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        os.replace(temporary, path)
 
     # train_losses 里以此为前缀的 key 归入"辅助层损失"子图；"total" 单独一张图
     # （量级远高于其它 loss，混在同图里会把主头 5 项的刻度压扁）；剩下的（主头
@@ -155,6 +167,8 @@ class CurveLogger:
 
         ax = axes[4]
         for k, v in self.eval_metrics.items():
+            if k.startswith('raw_'):
+                continue
             ax.plot(self.eval_epochs[: len(v)], v, marker="o", label=k, linewidth=1)
         ax.set_xlabel("epoch")
         ax.set_ylabel("mAP")
