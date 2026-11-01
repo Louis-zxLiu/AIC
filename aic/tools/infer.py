@@ -133,13 +133,14 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     model = build_tristream_dfine(cfg).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and "ema" in ckpt:
         # EMA 权重通常比原始权重更稳定（算法设计.md §3.1），优先使用。
         state = ckpt["ema"]
     else:
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)
+    del state, ckpt
     model.eval()
 
     postproc = DFINEPostProcessor(

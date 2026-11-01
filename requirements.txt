@@ -1,16 +1,13 @@
-# Exact versions used by the selected 703 run. Python 3.10, Linux CUDA GPU.
 torch==2.13.0
 torchvision==0.28.0
+numpy==2.2.6
+Pillow==12.3.0
+scipy==1.15.3
+PyYAML==6.0.3
 rfdetr==1.10.1
 rfdetr-plus==1.0.2
-faster-coco-eval==1.7.2
-PyYAML==6.0.3
-numpy==2.2.6
-scipy==1.15.3
-pillow==12.3.0
-matplotlib==3.10.9
-tensorboard==2.21.0
-loguru==0.7.3
-calflops==0.3.2
 transformers==5.14.1
-opencv-python-headless==4.11.0.86
+pycocotools==2.0.11
+matplotlib==3.10.9
+safetensors==0.8.0
+supervision==0.30.3

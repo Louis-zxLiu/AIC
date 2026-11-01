@@ -1,9 +1,30 @@
 {
-  "files_original": 1000,
-  "files_reproduced": 1000,
-  "different_files": 0,
-  "examples": [],
-  "threshold": 0.25,
-  "checkpoint": "student_epoch63_ema.pt",
-  "online_score_user_reported": 58.903
+  "passed": true,
+  "model": {
+    "strict_load": true,
+    "all_ema_tensors_equal": true,
+    "tensors": 1110,
+    "teachers_loaded": false,
+    "cuda_used": false,
+    "architecture": {
+      "windows_rgb": 4,
+      "windows_ir": 2,
+      "windows_depth": 4,
+      "decoder_layers": 4,
+      "queries": 300,
+      "opf_depth": 1
+    }
+  },
+  "G6_cached_reproduction": {
+    "images": 1000,
+    "boxes": 16286,
+    "different_TXT_files": 0,
+    "input_size": [
+      880,
+      1600
+    ],
+    "checkpoint_sha256": "75679ae9097d3d73028cdb0ef9761d2ab3e4b8057b9e360316c432454ca2959e",
+    "cache_identity_verified": true
+  },
+  "limitation": "Strict CPU EMA tensor equality and full1000 cached G6 reproduction were verified. No fresh full GPU forward or retraining was performed during release preparation."
 }

@@ -52,6 +52,8 @@ from aic.models.backbone import TriStreamHGNetv2
 from aic.models.tristream_dfine import build_single_modality_dfine, build_tristream_dfine
 from aic.utils.curves import CurveLogger
 from aic.utils.experiment_state import identity, capture_rng, restore_rng, accumulation_window
+from suite_runtime import boundary_guard, audit_resume
+from aic.sugon.common import canonical_hash
 from third_party_dfine import DFINECriterion, HungarianMatcher
 
 
@@ -340,6 +342,7 @@ def main():
 
     samples = scan_samples(train_cfg["data_root"], require_labels=True)
     explicit_split = bool(train_cfg.get('split_manifest'))
+    strict_resume = explicit_split or bool(train_cfg.get('exact_full_resume'))
     frequency_run = cfg.get('fusion', {}).get('type') == 'freqband'
     validation_provenance = cfg.get('validation_provenance', {'validation_independent': False, 'teacher_overlap': 329})
     if explicit_split:
@@ -369,7 +372,7 @@ def main():
         scale_range=tuple(train_cfg.get("scale_range", [0.5, 1.5])),
         final_scale_range=tuple(train_cfg.get("final_scale_range", [0.9, 1.1])),
         stop_decay_epoch_ratio=float(train_cfg.get("stop_decay_epoch_ratio", 0.8)),
-        total_epochs=train_cfg["epochs"],
+        total_epochs=train_cfg.get("schedule_epochs", train_cfg["epochs"]),
         no_aug_epoch=(
             int(train_cfg["no_aug_epoch"])
             if train_cfg.get("no_aug_epoch") is not None
@@ -525,7 +528,7 @@ def main():
             warm_state = warm_state["ema"]
         elif isinstance(warm_state, dict) and "model" in warm_state:
             warm_state = warm_state["model"]
-        warm_result = model.load_state_dict(warm_state, strict=context_run)
+        warm_result = model.load_state_dict(warm_state, strict=(context_run or bool(args.nas_search_manifest)))
         if context_run:
             from aic.models.dinov3_rgb import tensor_hash
             model.pretrained_report.update(source=args.warm_start_model, weight_source='ema',
@@ -783,6 +786,9 @@ def main():
     resume_epoch = None
     if args.resume and os.path.exists(args.resume):
         resume_probe = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if train_cfg.get('exact_full_resume'):
+            assert resume_probe.get('full_resume_identity') == canonical_hash(cfg), 'Full resume config identity differs'
+            assert resume_probe.get('world_size') == world_size, 'Full resume must keep DDP world size'
         if explicit_split and resume_probe.get('experiment_identity') != identity(cfg):
             raise ValueError('resume configuration/split identity differs from checkpoint')
         if (frequency_run or context_run or curriculum_run) and resume_probe.get('world_size') != world_size:
@@ -798,6 +804,9 @@ def main():
     # steps_per_epoch 是 optimizer step 数（调度器单位）；dataloader_steps 是
     # 实际迭代次数，仅用于日志进度显示。两者相差 grad_accum 倍。
     dataloader_steps = len(train_loader)
+    sampler_module = (model.module if world_size > 1 else model).sampler
+    sampler_module.runtime_steps_per_epoch = dataloader_steps
+    sampler_module.runtime_accum = grad_accum
     dino_warmup_steps = (
         int(float(dino_cfg.get("warmup_epochs", 0)) * dataloader_steps)
         if dino_cfg is not None
@@ -809,6 +818,9 @@ def main():
         if distill_cfg else 0
     )
     distill_final_scale = float(distill_cfg.get("final_scale", 1.0)) if distill_cfg else 1.0
+    distill_decay_end = int(distill_cfg.get("decay_end_epoch", train_cfg["epochs"])) if distill_cfg else train_cfg["epochs"]
+    if distill_final_scale < 1.0 and not distill_decay_start < distill_decay_end <= train_cfg["epochs"]:
+        raise ValueError("Invalid distill.decay_end_epoch")
     if not 0.0 <= distill_final_scale <= 1.0:
         raise ValueError("distill.final_scale must be in [0, 1]")
     if not 0 <= distill_decay_start < train_cfg["epochs"] and distill_final_scale != 1.0:
@@ -847,7 +859,7 @@ def main():
     steps_per_epoch = max(math.ceil(effective_steps / grad_accum) if explicit_split else dataloader_steps // grad_accum, 1)
     schedule_steps_per_epoch = steps_per_epoch
     if resume_scheduler_step is not None and resume_scheduler_step >= 0 and resume_epoch is not None and resume_epoch >= 0:
-        old_steps_per_epoch = round(resume_scheduler_step / max(resume_epoch + 1, 1))
+        old_steps_per_epoch = int(resume_probe.get('schedule_steps_per_epoch', round(resume_scheduler_step / max(resume_epoch + 1, 1))))
         if old_steps_per_epoch > 0:
             schedule_steps_per_epoch = max(schedule_steps_per_epoch, old_steps_per_epoch)
             if is_main_process() and schedule_steps_per_epoch != steps_per_epoch:
@@ -855,7 +867,7 @@ def main():
                     f"[scheduler] preserving resume step density: current={steps_per_epoch}, "
                     f"checkpoint={old_steps_per_epoch}, using={schedule_steps_per_epoch}"
                 )
-    total_steps = schedule_steps_per_epoch * train_cfg["epochs"]
+    total_steps = schedule_steps_per_epoch * train_cfg.get("schedule_epochs", train_cfg["epochs"])
     warmup_steps = schedule_steps_per_epoch * train_cfg["warmup_epochs"]
 
     lr_schedule = str(train_cfg.get("lr_schedule", "cosine")).lower()
@@ -899,6 +911,10 @@ def main():
         else None
     )
 
+    if is_main_process() and not args.resume:
+        from aic.serial_kd_schedule import record_initialization
+        initialization = record_initialization(model, distill_loss_fn, save_dir)
+        print(f"[initialization] {initialization}", flush=True)
     start_epoch = 0
     optimizer_updates = 0
     if args.resume and os.path.exists(args.resume):
@@ -926,8 +942,9 @@ def main():
         if ema is not None and "ema" in ckpt:
             ema.shadow = {k: v.to(device) for k, v in ckpt["ema"].items()}
             ema.updates = ckpt.get("ema_updates", 0)
-        if explicit_split:
+        if strict_resume:
             restore_rng(ckpt['rng_states'][rank], train_generator)
+            if train_cfg.get('exact_full_resume'): audit_resume(ckpt,model,optimizer,scheduler,scaler,ema,distill_loss_fn,train_generator,rank,cfg)
             if curve_logger is not None:
                 # Discard records written after the last atomically saved epoch.
                 curve_logger.truncate_after(ckpt['epoch'], dataloader_steps)
@@ -958,6 +975,7 @@ def main():
 
     end_epoch = min(train_cfg['epochs'], int(os.environ.get('AIC_STOP_AFTER_EPOCH', train_cfg['epochs'])))
     for epoch in range(start_epoch, end_epoch):
+        if boundary_guard(epoch - 1): break
         model.train()
         memory_probe = bool(train_cfg.get("memory_report_path"))
         if frequency_run or context_run or curriculum_run or memory_probe:
@@ -1094,14 +1112,9 @@ def main():
                             (epoch * dataloader_steps + step + 1) / max(distill_warmup_steps, 1),
                         ) if distill_warmup_steps > 0 else 1.0
                         if epoch >= distill_decay_start and distill_final_scale < 1.0:
-                            decay_steps = max(
-                                (train_cfg["epochs"] - distill_decay_start) * dataloader_steps - 1,
-                                1,
-                            )
-                            decay_step = (epoch - distill_decay_start) * dataloader_steps + step
-                            progress = min(max(decay_step / decay_steps, 0.0), 1.0)
-                            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-                            distill_scale = distill_final_scale + (1.0 - distill_final_scale) * cosine
+                            from aic.serial_kd_schedule import decay_scale
+                            distill_scale = decay_scale(epoch, step, dataloader_steps,
+                                                        distill_decay_start, distill_decay_end, distill_final_scale)
                         loss_dict["distill_scale"] = distill_total.new_tensor(distill_scale)
                         loss_dict["loss_distill"] = distill_total * distill_scale
                         loss_dict.update(
@@ -1164,6 +1177,9 @@ def main():
                 if optimizer_stepped:
                     scheduler.step()
                     optimizer_updates += 1
+                if optimizer_stepped:
+                    from aic.rf_nas.hbs import record_gradients
+                    record_gradients(model)
                 optimizer.zero_grad()
                 if ema is not None and optimizer_stepped:
                     ema.update(model)
@@ -1171,7 +1187,7 @@ def main():
             if is_main_process() and step % train_cfg["log_interval"] == 0:
                 base_keys = (
                     "loss_vfl", "loss_bbox", "loss_giou", "loss_gcd", "loss_fgl", "loss_ddf", "loss_fusion_fg",
-                    "loss_distill", "loss_ir", "loss_depth", "loss_cross",
+                    "loss_distill", "loss_ir", "loss_depth", "loss_cross", "loss_g5_consistency",
                     "distill_scale",
                     "weight_ir_dynamic", "weight_depth_dynamic",
                     "loss_ir_l0", "loss_ir_l1", "loss_ir_l2",
@@ -1199,8 +1215,11 @@ def main():
                 # （_aux_i=5 层中间 decoder 输出，_pre=首层传统检测头，_enc_i=encoder
                 # 辅助头，_dn_i/_dn_pre=去噪分支），主头 5 项之外全部计入这四组之一，
                 # 分组数值之和 + 主头总和 == total（sum(loss_dict.values())）。
-                group_sums = {"grp_aux": 0.0, "grp_enc": 0.0, "grp_dn": 0.0, "grp_pre": 0.0}
+                group_sums = {"grp_aux": 0.0, "grp_enc": 0.0, "grp_dn": 0.0, "grp_pre": 0.0, "grp_hbs": 0.0}
                 for k, v in loss_dict.items():
+                    if k.startswith('hbs_'):
+                        group_sums['grp_hbs'] += v.item()
+                        continue
                     # D-FINE uses ``_aux_i`` while native RF-DETR names
                     # intermediate decoder losses ``loss_*_i``.  Keep both
                     # conventions visible in the same diagnostic bucket.
@@ -1218,8 +1237,8 @@ def main():
                 curve_logger.save_json()
 
         rng_states = None
-        if explicit_split:
-            if train_cfg.get('max_steps_per_epoch') and distill_loss_fn is not None and world_size > 1:
+        if strict_resume:
+            if explicit_split and train_cfg.get('max_steps_per_epoch') and distill_loss_fn is not None and world_size > 1:
                 adapter_digest = tensor_hash({**{'ir.'+k:v for k,v in distill_loss_fn.ir_adapters.state_dict().items()},
                                               **{'depth.'+k:v for k,v in distill_loss_fn.depth_adapters.state_dict().items()}})
                 adapter_digests = [None] * world_size
@@ -1245,6 +1264,8 @@ def main():
                              'entry_state': epoch_entry_state,
                              'updates': optimizer_updates, 'lr': scheduler.get_last_lr(),
                              'ema_updates': ema.updates if ema else None})
+        from aic.rf_nas.hbs import epoch_record
+        epoch_record(model, cfg, epoch, rank, optimizer_updates)
         if memory_probe:
             from aic.sugon.common import atomic_json
             free_bytes, total_bytes = torch.cuda.mem_get_info(device)
@@ -1310,7 +1331,7 @@ def main():
                 curve_logger.plot()
                 curve_logger.save_json()
 
-            if explicit_split and eval_state_backup is not None:
+            if eval_state_backup is not None:
                 ema.restore(model, eval_state_backup)
                 eval_state_backup = None
             ckpt_path = os.path.join(save_dir, f"epoch{epoch}.pt")
@@ -1326,6 +1347,9 @@ def main():
                 ckpt.update(experiment_identity=identity(cfg), rng_states=rng_states,
                             optimizer_updates=optimizer_updates, world_size=world_size,
                             **validation_provenance)
+            if train_cfg.get('exact_full_resume'):
+                ckpt.update(rng_states=rng_states, optimizer_updates=optimizer_updates, world_size=world_size,
+                            full_resume_identity=canonical_hash(cfg), schedule_steps_per_epoch=schedule_steps_per_epoch)
             if frequency_run:
                 from aic.sugon.common import atomic_json
                 atomic_json(os.path.join(save_dir, f'runtime_epoch{epoch}.json'),
@@ -1358,6 +1382,8 @@ def main():
                     os.remove(tmp_path)
                 raise
             print(f"[ckpt] saved {ckpt_path}")
+            from aic.rf_nas.search_schedule import epoch_artifacts
+            epoch_artifacts(model, ckpt, cfg, epoch)
             if explicit_split:
                 from aic.sugon.common import atomic_json
                 atomic_json(os.path.join(save_dir, 'latest.json'), {'epoch':epoch, 'checkpoint':os.path.basename(ckpt_path), **identity(cfg)})
@@ -1413,6 +1439,7 @@ def main():
 
         if is_dist():
             dist.barrier()
+        if boundary_guard(epoch): break
 
     if is_dist():
         dist.destroy_process_group()

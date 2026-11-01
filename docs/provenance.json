@@ -1,59 +1,111 @@
 {
-  "online_score": 58.903,
-  "run": "full_student_w050_ir_off_depth_x2",
-  "original_config_sha256": "1c6964987f411f537f8ef960c8e67c4867df35bbc636ac2323e93d6828ea2dd5",
-  "source_origin": "703 isolated RF-DETR release",
-  "source_modules": [
-    "aic",
-    "aic.data",
-    "aic.data.context_views",
-    "aic.data.dataset",
-    "aic.data.frozen_split",
-    "aic.data.modalities",
-    "aic.data.transforms",
-    "aic.eval",
-    "aic.eval.map_evaluator",
-    "aic.eval.submission_postprocess",
-    "aic.eval.submission_validator",
-    "aic.models",
-    "aic.models.backbone",
-    "aic.models.criterion",
-    "aic.models.dinov3_rgb",
-    "aic.models.distill",
-    "aic.models.dwt",
-    "aic.models.freq_fusion",
-    "aic.models.gcd",
-    "aic.models.ir_alignment",
-    "aic.models.matcher",
-    "aic.models.opf_fusion",
-    "aic.models.pretrained",
-    "aic.models.tristream_dfine",
-    "aic.rf_nas",
-    "aic.rf_nas.distill",
-    "aic.rf_nas.entry",
-    "aic.rf_nas.model",
-    "aic.rf_native",
-    "aic.rf_native.assignment",
-    "aic.rf_native.distill",
-    "aic.rf_native.model",
-    "aic.sugon",
-    "aic.sugon.common",
-    "aic.sugon.split",
-    "aic.tools",
-    "aic.tools.infer",
-    "aic.tools.train",
-    "aic.utils",
-    "aic.utils.curves",
-    "aic.utils.experiment_state"
+  "team_id": "AIC-2026-19640904",
+  "team": "苏大一队",
+  "leader": "刘志轩",
+  "members": [
+    "刘志轩",
+    "朱文楦",
+    "孙延"
   ],
-  "changes": [
-    "portable data and checkpoint paths",
-    "tri-modal entry point only"
-  ],
-  "teacher_epochs_zero_based": {
-    "ir": 37,
-    "depth": 48
+  "stage": "半决赛",
+  "online_score": 56.132,
+  "score_source": "User-confirmed leaderboard score; not a fresh test evaluation",
+  "architecture": {
+    "windows_rgb": 4,
+    "windows_ir": 2,
+    "windows_depth": 4,
+    "decoder_layers": 4,
+    "queries": 300,
+    "opf_depth": 1
   },
-  "student_epoch_zero_based": 63,
-  "submission_sha256": "0184fc2b6cceedd8b86ab11c74ee2e024efe1976c1acd810fb9490044d170c3e"
+  "image_size": [
+    880,
+    1600
+  ],
+  "training": {
+    "images": 2000,
+    "epochs": 64,
+    "seed": 42,
+    "batch_per_gpu": 4,
+    "world_size": 2,
+    "effective_batch": 8,
+    "flat_ratio": 0.33,
+    "HBS": {
+      "enabled": true,
+      "channels": 512,
+      "reduction": 4,
+      "kernel_size": 5,
+      "padding_cells": 1,
+      "clean_loss_weight": 0.5,
+      "hbs_loss_weight": 0.5,
+      "location": "opf_fused_p4",
+      "api_enabled": false
+    },
+    "lowlight": {
+      "enabled": true,
+      "probability": 0.25,
+      "gamma": [
+        1.5,
+        2.5
+      ],
+      "gain": [
+        0.4,
+        0.8
+      ],
+      "active_in_final_epochs": true
+    },
+    "distill_global": 0.5,
+    "distill_ir": 0,
+    "distill_depth": 2
+  },
+  "environment": {
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+    "numpy": "2.2.6",
+    "Pillow": "12.3.0",
+    "scipy": "1.15.3",
+    "PyYAML": "6.0.3",
+    "rfdetr": "1.10.1",
+    "rfdetr-plus": "1.0.2",
+    "transformers": "5.14.1",
+    "pycocotools": "2.0.11",
+    "matplotlib": "3.10.9",
+    "safetensors": "0.8.0",
+    "supervision": "0.30.3"
+  },
+  "test_used_for_training": false,
+  "model_ensemble": false,
+  "teacher_required_for_inference": false,
+  "checkpoint": {
+    "path": "weights/student_epoch47_ema.pt",
+    "sha256": "75679ae9097d3d73028cdb0ef9761d2ab3e4b8057b9e360316c432454ca2959e",
+    "epoch_index": 47,
+    "completed_epochs": 48,
+    "ema_tensors": 1110,
+    "ema_updates": 15072,
+    "inference_only": true
+  },
+  "result": {
+    "path": "not_stored_in_git",
+    "sha256": "a271eafbe02b4529083127b1664a71d689127c2c163092793bbb98c7a9f540b6",
+    "images": 1000,
+    "boxes": 16286,
+    "score_threshold": 0.25,
+    "max_boxes": 100,
+    "spec": {
+      "name": "g6_tile_demote",
+      "grid": 2,
+      "overlap": 0.2,
+      "flipped": false,
+      "iou": 0.6,
+      "coordinates": "weighted",
+      "routing": false,
+      "demote_tile_only": 0.5
+    }
+  },
+  "download": {
+    "url": "https://pan.baidu.com/s/1N9V1Nkt5HoqH2QnzQSB9HA?pwd=sunh",
+    "extraction_code": "sunh",
+    "type": "team-shared competition materials folder"
+  }
 }

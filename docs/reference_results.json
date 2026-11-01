@@ -1,0 +1,10 @@
+{
+  "images": 1000,
+  "boxes": 16286,
+  "archive_sha256": "a271eafbe02b4529083127b1664a71d689127c2c163092793bbb98c7a9f540b6",
+  "prediction_contents_sha256": "064d7d641d2fca0de9418712a24074eb00ac89bd1370c32eaa7610f47196dc82",
+  "contents_hash_definition": "For each TXT filename sorted lexicographically, SHA256.update(nameUTF8+NUL), update(rawTXTbytes), update(NUL). ZIP timestamps and compression are excluded.",
+  "epoch": 47,
+  "confidence": 0.25,
+  "max_boxes": 100
+}

@@ -110,7 +110,7 @@ train:
 inference:
   score_thresh: 0.25
   max_boxes: 100
-rf_pretrained: weights/rf-detr-xxlarge.pth
+rf_pretrained: training_weights/rf-detr-xxlarge.pth
 nas:
   windows:
   - 2

@@ -30,23 +30,36 @@ class ModalityInput(nn.Module):
         return normalize(x)
 
 
-def build_native(cfg):
+def build_native(cfg, *, initialize_weights=True):
     global MODEL_CONFIG
-    from rfdetr_plus import RFDETR2XLarge
-    wrapper=RFDETR2XLarge(pretrain_weights=cfg['rf_pretrained'],num_classes=12,
-                         resolution=880,gradient_checkpointing=True)
-    native=wrapper.model.model; MODEL_CONFIG=wrapper.model_config
-    source=torch.load(cfg['rf_pretrained'],map_location='cpu',weights_only=False)['model']
-    current=native.state_dict()
-    body=[k for k in source if not k.startswith(('class_embed.','transformer.enc_out_class_embed.'))]
-    errors=[k for k in body if k not in current or source[k].shape!=current[k].shape or not torch.equal(source[k],current[k])]
-    if errors: raise RuntimeError(f'Pretrained RF body mismatch: {errors[:10]}')
+    if initialize_weights:
+        from rfdetr_plus import RFDETR2XLarge
+        wrapper=RFDETR2XLarge(pretrain_weights=cfg['rf_pretrained'],num_classes=12,
+                             resolution=880,gradient_checkpointing=True)
+        native=wrapper.model.model; MODEL_CONFIG=wrapper.model_config
+        source=torch.load(cfg['rf_pretrained'],map_location='cpu',weights_only=False)['model']
+        current=native.state_dict()
+        body=[k for k in source if not k.startswith(('class_embed.','transformer.enc_out_class_embed.'))]
+        errors=[k for k in body if k not in current or source[k].shape!=current[k].shape or not torch.equal(source[k],current[k])]
+        if errors: raise RuntimeError(f'Pretrained RF body mismatch: {errors[:10]}')
+    else:
+        from rfdetr_plus.models.detection import RFDETR2XLargeConfig
+        from rfdetr.models.lwdetr import build_model_from_config
+        # Build the same graph directly, bypassing the RF wrapper's download/load
+        # hooks. The default pretrain filename is only a builder flag disabling
+        # DINO hub loading; this builder never opens that file. The caller must
+        # strictly load the complete student checkpoint before any prediction.
+        MODEL_CONFIG=RFDETR2XLargeConfig(num_classes=12,resolution=880,
+                                        gradient_checkpointing=True)
+        native=build_model_from_config(MODEL_CONFIG)
+        body=[]
     hidden=native.class_embed.in_features
     def head():
         layer=nn.Linear(hidden,12); nn.init.constant_(layer.bias,-math.log(99.)); return layer
     native.class_embed=head()
     native.transformer.enc_out_class_embed=nn.ModuleList([head() for _ in range(native.group_detr)])
-    return native,{'architecture':'RF-DETR 2XL','exact_pretrained_body_tensors':len(body),'num_classes':12}
+    return native,{'architecture':'RF-DETR 2XL','exact_pretrained_body_tensors':len(body),
+                   'num_classes':12,'initialize_weights':initialize_weights}
 
 
 class RFBranch(nn.Module):

@@ -88,6 +88,9 @@ class ArchitectureSampler(nn.Module):
         return Architecture(wr, wi, wd, dec, query, opf)
 
     def choose(self, training: bool) -> Architecture:
+        if self.cfg.get("expanded_search"):
+            from .search_schedule import choose
+            return choose(self, training, Architecture)
         force = self.cfg.get("force_arch")
         if force:
             arch = Architecture(**force)
@@ -116,19 +119,29 @@ class ElasticFusionBackbone(nn.Module):
         self.ir = RFBranch(copy.deepcopy(native), "ir")
         self.depth = RFBranch(copy.deepcopy(native), "depth")
         self.teacher_init = {}
-        for mode in ("ir", "depth"):
-            self.teacher_init[mode] = load_branch(
-                getattr(self, mode), cfg["distill"][mode + "_teacher_ckpt"], cfg["train"].get("split_sha256")
-            )
+        if not cfg.get("inference_only", False):
+            for mode in ("ir", "depth"):
+                self.teacher_init[mode] = load_branch(
+                    getattr(self, mode), cfg["distill"][mode + "_teacher_ckpt"], cfg["train"].get("split_sha256")
+                )
         self.opf1 = MultiScaleOPF([512], num_heads=8, sr_ratios=[2], hard_depth_gate=True)
         self.opf2 = MultiScaleOPF([512], num_heads=8, sr_ratios=[2], hard_depth_gate=True)
-        self.opf2_gain = nn.Parameter(torch.tensor(0.01))
+        self.opf2_gain = nn.Parameter(torch.tensor(math.log(0.01 / 0.99)))
         self.active_inputs = None
         self.active_arch: Architecture | None = None
         self.saved = None
+        self.hbs_cache = None
+        self.hbs_cached_mode = False
+        self.hbs_targets = None
 
     def forward(self, samples):
         from rfdetr.utilities.tensors import NestedTensor
+        if self.hbs_cached_mode:
+            assert self.training and self.hbs_cache is not None and self.hbs_targets is not None
+            features, pos, cross = self.hbs_cache
+            tensor, mask = features[0].decompose()
+            smoothed = self.hbs_smoother(tensor, self.hbs_targets, mask)
+            return [NestedTensor(smoothed, mask)], pos, cross
         if self.active_inputs is None or self.active_arch is None:
             raise RuntimeError("elastic fusion context was not installed")
         ir_input, depth_input = self.active_inputs
@@ -145,10 +158,13 @@ class ElasticFusionBackbone(nn.Module):
         fused = self.opf1(rf, inf, df, depth_valid_mask=depth_input[:, 4:5])
         if arch.opf_depth == 2:
             refined = self.opf2(fused, inf, df, depth_valid_mask=depth_input[:, 4:5])
-            gain = self.opf2_gain.clamp(0.0, 1.0)
+            gain = self.opf2_gain.sigmoid()
             fused = [a + gain * (b - a) for a, b in zip(fused, refined)]
         self.saved = (rf, inf, df)
-        return [NestedTensor(fused[0], rgb[0].mask)], pos, cross
+        result = [NestedTensor(fused[0], rgb[0].mask)]
+        if self.training and hasattr(self, 'hbs_smoother'):
+            self.hbs_cache = (result, pos, cross)
+        return result, pos, cross
 
 
 class RFNASDetector(nn.Module):
@@ -158,7 +174,7 @@ class RFNASDetector(nn.Module):
             raise ValueError("frozen external backbone is unsupported")
         self.cfg = cfg
         self.modality = modality
-        self.detector, self.pretrained_report = build_native(cfg)
+        self.detector, self.pretrained_report = build_native(cfg, initialize_weights=not cfg.get("inference_only", False))
         self.input = ModalityInput(modality or "rgb")
         self.sampler = ArchitectureSampler(cfg, student=modality is None)
         self.detector.transformer.register_forward_pre_hook(self._slice_group_queries, with_kwargs=True)
@@ -169,6 +185,9 @@ class RFNASDetector(nn.Module):
             self.pretrained_report["independent_backbones"] = True
         self.pretrained_report.update(modality=modality or "rgb_ir_depth", nas=True,
                                       native_decoder_layers=len(self.detector.transformer.decoder.layers))
+        if modality is None and cfg.get('hbs', {}).get('enabled', False):
+            from .hbs import install
+            self.pretrained_report['hbs'] = install(self, cfg)
 
     @property
     def backbone(self):
@@ -207,14 +226,25 @@ class RFNASDetector(nn.Module):
             return _select_decoder_output(out, arch.decoder_layers)
         self.backbone.active_inputs = (ir, depth)
         self.backbone.active_arch = arch
+        augmented = None
         try:
             out = self.detector(self.input(rgb), targets)
             features = self.backbone.saved
+            if self.training and self.cfg.get('hbs', {}).get('enabled', False):
+                assert targets is not None
+                self.backbone.hbs_cached_mode = True
+                self.backbone.hbs_targets = targets
+                augmented = self.detector(self.input(rgb), targets)
         finally:
+            self.backbone.hbs_cache = None
+            self.backbone.hbs_cached_mode = False
+            self.backbone.hbs_targets = None
             self.backbone.active_inputs = None
             self.backbone.active_arch = None
             self.backbone.saved = None
         out = _select_decoder_output(out, arch.decoder_layers)
+        if augmented is not None:
+            out['hbs_outputs'] = _select_decoder_output(augmented, arch.decoder_layers)
         return (out, *features) if return_backbone_feats else out
 
 
@@ -228,6 +258,7 @@ class NASCriterion(nn.Module):
         self.native.num_classes = 12
 
     def forward(self, outputs, targets):
+        hbs_outputs = outputs.pop('hbs_outputs', None)
         depth = int(outputs.pop("nas_decoder_layers"))
         def fp32(value):
             if isinstance(value, torch.Tensor): return value.float() if value.is_floating_point() else value
@@ -241,14 +272,18 @@ class NASCriterion(nn.Module):
         for key, value in raw.items():
             if key in self.native.weight_dict:
                 result[key] = value * self.native.weight_dict[key] * (1.0 if key.endswith("_enc") else decoder_scale)
-        return result
+        if hbs_outputs is None:
+            return result
+        auxiliary = self.forward(hbs_outputs, targets)
+        return {**{k: .5 * v for k, v in result.items()},
+                **{'hbs_' + k: .5 * v for k, v in auxiliary.items()}}
 
 
 def param_groups(model, lr, backbone_lr_mult, weight_decay, **unused):
     groups = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad: continue
-        if any(token in name for token in (".opf1.", ".opf2.", "opf2_gain", ".input.")) or name.startswith("input.") or "class_embed" in name:
+        if any(token in name for token in (".opf1.", ".opf2.", "opf2_gain", ".input.", ".hbs_")) or name.startswith("input.") or "class_embed" in name:
             rate = lr
         elif ".backbone." in name:
             rate = lr * backbone_lr_mult

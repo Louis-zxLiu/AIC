@@ -68,8 +68,8 @@ train:
   n_folds: 5
   fold: 0
   full_data: true
-  batch_size: 1
-  grad_accum_steps: 4
+  batch_size: 4
+  grad_accum_steps: 1
   epochs: 64
   warmup_epochs: 2
   lr: 0.0001
@@ -79,10 +79,10 @@ train:
   amp_dtype: bfloat16
   modality_dropout_p: 0.1
   num_workers: 2
-  save_dir: outputs/student_best
+  save_dir: outputs/student
   log_interval: 10
   eval_interval_epochs: 1
-  keep_last_n: 2
+  keep_last_n: 1
   keep_best_n: 0
   ema:
     enabled: true
@@ -106,14 +106,22 @@ train:
   eval_max_boxes: 100
   submission_eval: true
   retain_epochs:
+  - 31
   - 47
   - 63
+  nas_ema_epochs:
+  - 33
+  - 47
+  - 63
+  memory_report_path: memory
+  save_eval_predictions: false
+  exact_full_resume: true
 inference:
   score_thresh: 0.25
   max_boxes: 100
 distill:
-  ir_teacher_ckpt: weights/teacher_ir_epoch37.pt
-  depth_teacher_ckpt: weights/teacher_depth_epoch48.pt
+  ir_teacher_ckpt: training_weights/teacher_ir_epoch37.pt
+  depth_teacher_ckpt: training_weights/teacher_depth_epoch48.pt
   method: pkd_lcm
   weight: 0.5
   ir_weight: 0.0
@@ -126,7 +134,7 @@ distill:
   cross_weight: 0.0
   adapter_reduction: 16
   warmup_epochs: 8
-rf_pretrained: weights/rf-detr-xxlarge.pth
+rf_pretrained: training_weights/rf-detr-xxlarge.pth
 nas:
   windows:
   - 2
@@ -148,19 +156,50 @@ nas:
     - 1600
   steps_per_epoch: 506
   eval_arch: &id001
-    windows_rgb: 2
+    windows_rgb: 4
     windows_ir: 2
     windows_depth: 4
-    decoder_layers: 3
+    decoder_layers: 4
     queries: 300
     opf_depth: 1
   opf_depth:
   - 1
   - 2
   force_arch: *id001
+  expanded_search: false
 experiment:
-  name: full_student_w050_ir_off_depth_x2
-  question: Does Depth-only distillation outperform balanced IR+Depth at fixed total
-    coefficient?
-  control: Sugon full_student_d050 fixed weight 0.5
-  created_for: 2026-09-26 serial ablations
+  name: best56132_rf_w424_d4_hbs_lowlight
+  arm: lowlight
+  preflight: false
+  audit_initialization: true
+  protocol: Full2000 seed42, batch4x2,64epochs; selectedepoch47EMA originalG6
+  user_requested_direct_full: true
+  inference_enabled: true
+validation_provenance:
+  validation_independent: false
+  teacher_overlap: 0
+  full_data: true
+  train_samples: 2000
+  val_samples: 0
+  grouping_limit: Filename sequences and conservative visual duplicate grouping; unknown
+    scenes may still span groups.
+lowlight_augmentation:
+  enabled: true
+  probability: 0.25
+  gamma:
+  - 1.5
+  - 2.5
+  gain:
+  - 0.4
+  - 0.8
+  active_in_final_epochs: true
+hbs:
+  enabled: true
+  channels: 512
+  reduction: 4
+  kernel_size: 5
+  padding_cells: 1
+  clean_loss_weight: 0.5
+  hbs_loss_weight: 0.5
+  location: opf_fused_p4
+  api_enabled: false

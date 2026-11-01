@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "version": "semifinal56.132 epoch47EMA originalG6 conf0.25",
+  "files": 151,
+  "python_files": 132,
+  "weights_in_git": false,
+  "datasets_in_git": false,
+  "results_zip_in_git": false,
+  "credential_scan_passed": true,
+  "private_paths_removed": true,
+  "numerical_functions_AST_identical": 8,
+  "core_model_and_preprocessing_AST_identical": 6,
+  "default_checkpoint": "weights/student_epoch47_ema.pt",
+  "README_links_verified": true,
+  "CPU_tests_passed": 16,
+  "original_submission_content_hash_verified": true,
+  "license": "MIT for original contributions; third-party exclusions in NOTICE",
+  "repository_visibility_change": false,
+  "GPU_work_started": false
+}

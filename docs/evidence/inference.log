@@ -1,8 +1,0 @@
-[2026-09-27 08:11:29] [INFO] rf-detr - File /home/u703/AIC_Project_sy/AIC/experiments/rf_native_nas_s42_64_20260921_703/weights/rf-detr-xxlarge.pth already exists with correct MD5 hash.
-[2026-09-27 08:11:29] [WARNING] rf-detr - Using a different number of positional encodings than DINOv2, which means we're not loading DINOv2 backbone weights. This is not a problem if finetuning a pretrained RF-DETR model.
-[2026-09-27 08:11:29] [WARNING] rf-detr - Using patch size 20 instead of 14, which means we're not loading DINOv2 backbone weights. This is not a problem if finetuning a pretrained RF-DETR model.
-[2026-09-27 08:11:31] [INFO] rf-detr - File /home/u703/AIC_Project_sy/AIC/experiments/rf_native_nas_s42_64_20260921_703/weights/rf-detr-xxlarge.pth already exists with correct MD5 hash.
-[2026-09-27 08:11:32] [WARNING] rf-detr - Checkpoint has 90 classes but model is configured for 12. The detection head will be re-initialized to 12 classes.
-[infer] image_size=[880, 1600] disp8_mode=use
-[OK] 1000 个预测文件写入 /home/u703/AIC_Project_sy/AIC/experiments/rf_native_nas_s42_64_20260921_703/outputs/full_student_w050_ir_off_depth_x2/phase2_epoch63_conf025，格式校验通过。
-[OK] 打包完成: /home/u703/AIC_Project_sy/AIC/experiments/rf_native_nas_s42_64_20260921_703/outputs/full_student_w050_ir_off_depth_x2/phase2_epoch63_conf025.zip

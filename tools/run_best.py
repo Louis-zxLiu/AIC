@@ -1,60 +1,37 @@
-"""Portable entry point for the selected teachers, student and phase-2 inference."""
+"""Reproduce the selected student or retrain its teachers and student."""
 from pathlib import Path
-import argparse
-import os
-import subprocess
-import sys
-import yaml
-
-ROOT = Path(__file__).resolve().parents[1]
-
+import argparse,os,subprocess,sys,yaml
+ROOT=Path(__file__).resolve().parents[1]
 def main():
-    ap=argparse.ArgumentParser()
-    ap.add_argument('mode',choices=['train','infer'])
-    ap.add_argument('--stage',choices=['teacher_ir','teacher_depth','student_best'],default='student_best')
-    ap.add_argument('--data-root',type=Path)
-    ap.add_argument('--test-root',type=Path)
-    ap.add_argument('--weights-dir',type=Path,default=ROOT/'weights')
-    ap.add_argument('--output-dir',type=Path)
-    ap.add_argument('--checkpoint',type=Path)
-    ap.add_argument('--gpus',default='2,3')
-    ap.add_argument('--resume',type=Path)
-    args=ap.parse_args()
-    if args.mode=='train' and args.data_root is None:ap.error('--data-root is required for training')
-    if args.mode=='infer' and (args.test_root is None or args.stage!='student_best'):ap.error('inference requires --test-root and stage student_best')
-    weights=args.weights_dir.resolve()
-    out=(args.output_dir or ROOT/'outputs'/args.stage).resolve()
-    out.mkdir(parents=True,exist_ok=True)
-    cfg=yaml.safe_load((ROOT/'configs'/f'{args.stage}.yml').read_text(encoding='utf-8'))
-    cfg['rf_pretrained']=str(weights/'rf-detr-xxlarge.pth')
-    cfg['train']['save_dir']=str(out)
-    if args.data_root:cfg['train']['data_root']=str(args.data_root.resolve())
-    if 'distill' in cfg:
-        cfg['distill']['ir_teacher_ckpt']=str(weights/'teacher_ir_epoch37.pt')
-        cfg['distill']['depth_teacher_ckpt']=str(weights/'teacher_depth_epoch48.pt')
-    resolved=out/'resolved_config.yml'
-    resolved.write_text(yaml.safe_dump(cfg,sort_keys=False,allow_unicode=True),encoding='utf-8')
-    required=[Path(cfg['rf_pretrained'])]
-    if 'distill' in cfg:required += [Path(cfg['distill'][m+'_teacher_ckpt']) for m in ['ir','depth']]
-    for path in required:
-        if not path.is_file():raise FileNotFoundError(path)
-    env=os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=args.gpus,PYTHONPATH=str(ROOT),NCCL_P2P_DISABLE='1',NCCL_IB_DISABLE='1',OMP_NUM_THREADS='4')
-    command=[sys.executable,'-u']
-    if args.mode=='train':
-        count=len(args.gpus.split(','))
-        if count>1:command += ['-m','torch.distributed.run','--standalone',f'--nproc_per_node={count}']
-    command += ['-m','aic.rf_nas.entry',args.mode,'--config',str(resolved)]
-    if args.mode=='train':
-        if args.stage.startswith('teacher_'):command += ['--mono_modality',args.stage.removeprefix('teacher_')]
-        if args.resume:command += ['--resume',str(args.resume.resolve())]
-    else:
-        checkpoint=(args.checkpoint or weights/'student_epoch63_ema.pt').resolve()
-        if not checkpoint.is_file():raise FileNotFoundError(checkpoint)
-        command += ['--checkpoint',str(checkpoint),'--test_root',str(args.test_root.resolve()),
-                    '--out_dir',str(out/'predictions'),'--zip_path',str(out/'submission_epoch63_conf025.zip'),
-                    '--score_thresh','0.25','--max_boxes','100']
-    print(' '.join(command),flush=True)
-    subprocess.run(command,cwd=ROOT,env=env,check=True)
-
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=['infer','train'])
+ p.add_argument('--stage',choices=['student','teacher_ir','teacher_depth'],default='student')
+ p.add_argument('--test-root',type=Path);p.add_argument('--data-root',type=Path)
+ p.add_argument('--weights-dir',type=Path);p.add_argument('--checkpoint',type=Path)
+ p.add_argument('--output-dir',type=Path);p.add_argument('--gpus',default='0');p.add_argument('--resume',type=Path)
+ a=p.parse_args();env=os.environ.copy();env.update(CUDA_VISIBLE_DEVICES=a.gpus,PYTHONPATH=str(ROOT),OMP_NUM_THREADS='4',NCCL_P2P_DISABLE='1',NCCL_IB_DISABLE='1',PYTHONDONTWRITEBYTECODE='1')
+ if a.mode=='infer':
+  if not a.test_root:p.error('--test-root is required')
+  if ',' in a.gpus:p.error('Inference uses one GPU; select one physical index')
+  command=[sys.executable,'-B','-u','-m','aic.best56132.inference','--test-root',str(a.test_root.resolve())]
+  checkpoint=a.checkpoint or (a.weights_dir or ROOT/'weights')/'student_epoch47_ema.pt'
+  command += ['--checkpoint',str(checkpoint.resolve())]
+  if a.output_dir:command += ['--output-dir',str(a.output_dir.resolve())]
+ else:
+  if not a.data_root:p.error('--data-root is required')
+  weights=(a.weights_dir or ROOT/'training_weights').resolve();out=(a.output_dir or ROOT/'outputs'/a.stage).resolve();out.mkdir(parents=True,exist_ok=True)
+  cfg=yaml.safe_load((ROOT/'configs'/f'{a.stage}.yml').read_text(encoding='utf-8'))
+  cfg['train']['data_root']=str(a.data_root.resolve());cfg['train']['save_dir']=str(out);cfg['rf_pretrained']=str(weights/'rf-detr-xxlarge.pth')
+  required=[Path(cfg['rf_pretrained'])]
+  if a.stage=='student':
+   for m,ep in [('ir',37),('depth',48)]:cfg['distill'][m+'_teacher_ckpt']=str(weights/f'teacher_{m}_epoch{ep}.pt');required.append(Path(cfg['distill'][m+'_teacher_ckpt']))
+  for q in required:
+   if not q.is_file():raise FileNotFoundError(q)
+  resolved=out/'resolved_config.yml';resolved.write_text(yaml.safe_dump(cfg,sort_keys=False,allow_unicode=True),encoding='utf-8')
+  env.update(DECAY_STOP_FILE=str(out/'stop_requested'),DECAY_NIGHT_GUARD='0')
+  command=[sys.executable,'-B','-u'];count=len(a.gpus.split(','))
+  if count>1:command += ['-m','torch.distributed.run','--standalone',f'--nproc_per_node={count}']
+  command += ['-m','aic.best56132.train_entry','train','--config',str(resolved)]
+  if a.stage.startswith('teacher_'):command += ['--mono_modality',a.stage.removeprefix('teacher_')]
+  if a.resume:command += ['--resume',str(a.resume.resolve())]
+ print(' '.join(command),flush=True);subprocess.run(command,cwd=ROOT,env=env,check=True)
 if __name__=='__main__':main()
